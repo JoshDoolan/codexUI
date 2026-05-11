@@ -541,6 +541,7 @@
               :head-date="currentThreadHeadDate"
               :detached="isThreadDetachedHead"
               :dirty="isThreadWorktreeDirty"
+              :worktree-change-summary="threadWorktreeChangeSummary"
               :branches="threadBranchOptions"
               :commits-by-branch="threadBranchCommitsByBranch"
               :commits-loading-for="threadBranchCommitsLoadingFor"
@@ -1106,6 +1107,7 @@ import {
   getGitBranchCommits,
   getGitCommitFiles,
   getGitRepositoryStatus,
+  getReviewSnapshot,
   getWorktreeBranchOptions,
   getAccounts,
   completeCodexLogin,
@@ -1435,6 +1437,7 @@ let terminalKeyboardFocusFallbackTimer: ReturnType<typeof setTimeout> | null = n
 let threadBranchesRequestId = 0
 let threadBranchCommitsRequestId = 0
 let threadCommitFilesRequestId = 0
+let threadWorktreeSummaryRequestId = 0
 const defaultNewProjectName = ref('New Project (1)')
 const homeDirectory = ref('')
 const isSettingsOpen = ref(false)
@@ -1449,6 +1452,7 @@ const currentThreadHeadSubject = ref<string | null>(null)
 const currentThreadHeadDate = ref<string | null>(null)
 const isThreadDetachedHead = ref(false)
 const isThreadWorktreeDirty = ref(false)
+const threadWorktreeChangeSummary = ref({ addedLineCount: 0, removedLineCount: 0 })
 const threadBranchError = ref('')
 const threadBranchCommitsByBranch = ref<Record<string, GitCommitOption[]>>({})
 const threadBranchCommitsLoadingFor = ref('')
@@ -3105,6 +3109,7 @@ function resetThreadBranchState(): void {
   threadBranchesRequestId += 1
   threadBranchCommitsRequestId += 1
   threadCommitFilesRequestId += 1
+  threadWorktreeSummaryRequestId += 1
   threadBranchOptions.value = []
   currentThreadBranch.value = null
   currentThreadHeadSha.value = null
@@ -3112,6 +3117,7 @@ function resetThreadBranchState(): void {
   currentThreadHeadDate.value = null
   isThreadDetachedHead.value = false
   isThreadWorktreeDirty.value = false
+  threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
   threadBranchCommitsByBranch.value = {}
   threadBranchCommitsLoadingFor.value = ''
   threadBranchCommitsError.value = ''
@@ -3120,6 +3126,27 @@ function resetThreadBranchState(): void {
   threadCommitFilesError.value = ''
   threadBranchError.value = ''
   isLoadingThreadBranches.value = false
+}
+
+function loadThreadWorktreeChangeSummary(cwd: string): void {
+  const targetCwd = cwd.trim()
+  if (!targetCwd) {
+    threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
+    return
+  }
+  const requestId = ++threadWorktreeSummaryRequestId
+  void getReviewSnapshot(targetCwd, 'workspace', 'unstaged')
+    .then((snapshot) => {
+      if (requestId !== threadWorktreeSummaryRequestId || !canLoadBranchStateForCwd(targetCwd)) return
+      threadWorktreeChangeSummary.value = {
+        addedLineCount: snapshot.summary.addedLineCount,
+        removedLineCount: snapshot.summary.removedLineCount,
+      }
+    })
+    .catch(() => {
+      if (requestId !== threadWorktreeSummaryRequestId || !canLoadBranchStateForCwd(targetCwd)) return
+      threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
+    })
 }
 
 async function loadThreadBranches(cwd: string): Promise<void> {
@@ -3141,6 +3168,7 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadHeadDate.value = state.headDate
     isThreadDetachedHead.value = state.detached
     isThreadWorktreeDirty.value = state.dirty
+    loadThreadWorktreeChangeSummary(targetCwd)
     const defaultBranchForCommits = state.currentBranch?.trim() || state.options[0]?.value?.trim() || ''
     if (defaultBranchForCommits) loadThreadBranchCommits({ branch: defaultBranchForCommits, includeResetHistory: true })
   } catch {
@@ -3152,6 +3180,7 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadHeadDate.value = null
     isThreadDetachedHead.value = false
     isThreadWorktreeDirty.value = false
+    threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
   } finally {
     if (requestId === threadBranchesRequestId) {
       isLoadingThreadBranches.value = false
@@ -3166,6 +3195,7 @@ function applyThreadGitState(state: { currentBranch: string | null; headSha: str
   currentThreadHeadDate.value = state.headDate
   isThreadDetachedHead.value = state.detached
   isThreadWorktreeDirty.value = state.dirty
+  loadThreadWorktreeChangeSummary(composerCwd.value)
 }
 
 function onCheckoutContentHeaderBranch(value: string): void {
