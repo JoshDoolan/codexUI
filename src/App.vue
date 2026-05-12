@@ -919,6 +919,9 @@
                   :models="composerModelIds" :selected-model="composerSelectedModelId"
                   :selected-reasoning-effort="selectedReasoningEffort"
                   :selected-speed-mode="selectedSpeedMode"
+                  :force-fast-mode-available="selectedSessionSource === 'openclaw'"
+                  :fast-mode-description="selectedSessionSource === 'openclaw' ? openClawFastModeDescription : undefined"
+                  :slash-commands="selectedSessionSource === 'openclaw' ? openClawCommands : []"
                   :is-updating-speed-mode="isUpdatingSpeedMode"
                   :skills="installedSkills"
                   :thread-token-usage="selectedThreadTokenUsage"
@@ -996,6 +999,9 @@
                     :selected-model="composerSelectedModelId"
                     :selected-reasoning-effort="selectedReasoningEffort"
                     :selected-speed-mode="selectedSpeedMode"
+                    :force-fast-mode-available="selectedSessionSource === 'openclaw'"
+                    :fast-mode-description="selectedSessionSource === 'openclaw' ? openClawFastModeDescription : undefined"
+                    :slash-commands="selectedSessionSource === 'openclaw' ? openClawCommands : []"
                     :is-updating-speed-mode="isUpdatingSpeedMode"
                     :skills="installedSkills"
                     :thread-token-usage="selectedThreadTokenUsage"
@@ -1337,6 +1343,7 @@ const {
   availableCollaborationModes,
   availableModelIds,
   openClawModelIds,
+  openClawCommands,
   selectedCollaborationMode,
   selectedModelId,
   selectedReasoningEffort,
@@ -1378,6 +1385,7 @@ const {
 
   setSelectedReasoningEffort,
   updateSelectedSpeedMode,
+  setSelectedSpeedModeForOpenClaw,
   respondToPendingServerRequest,
   renameProject,
   removeProject,
@@ -1608,6 +1616,11 @@ const latestUserTurnId = computed(() => {
 })
 const liveOverlay = computed(() => selectedLiveOverlay.value)
 const composerThreadContextId = computed(() => (isHomeRoute.value ? '__new-thread__' : selectedThreadId.value))
+const openClawFastModeDescription = computed(() => (
+  selectedSpeedMode.value === 'fast'
+    ? t('Uses minimal OpenClaw thinking for quicker replies')
+    : t('Uses the selected OpenClaw thinking level')
+))
 const composerModelIds = computed(() => (
   selectedSessionSource.value === 'openclaw' && openClawModelIds.value.length > 0
     ? openClawModelIds.value
@@ -3681,6 +3694,10 @@ function onSelectReasoningEffort(effort: ReasoningEffort | ''): void {
 }
 
 function onSelectSpeedMode(mode: SpeedMode): void {
+  if (selectedSessionSource.value === 'openclaw') {
+    setSelectedSpeedModeForOpenClaw(mode)
+    return
+  }
   void updateSelectedSpeedMode(mode)
 }
 

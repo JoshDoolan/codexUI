@@ -38,9 +38,11 @@ import {
   type WorkspaceRootsState,
 } from '../api/codexGateway'
 import {
+  getOpenClawCommands,
   getOpenClawThreadDetail,
   getOpenClawThreadGroupsPage,
   getOpenClawModelIds,
+  type OpenClawCommandInfo,
   isOpenClawThreadId,
   startOpenClawThread,
   startOpenClawThreadTurnStream,
@@ -1399,6 +1401,7 @@ export function useDesktopState() {
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const openClawModelIds = ref<string[]>([])
+  const openClawCommands = ref<OpenClawCommandInfo[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
     { value: 'default', label: 'Default' },
     { value: 'plan', label: 'Plan' },
@@ -1940,6 +1943,16 @@ export function useDesktopState() {
     }
   }
 
+  function setSelectedSpeedModeForOpenClaw(mode: SpeedMode): void {
+    selectedSpeedMode.value = mode === 'fast' ? 'fast' : 'standard'
+  }
+
+  function readOpenClawThinkingLevel(): string {
+    return selectedSpeedMode.value === 'fast'
+      ? 'minimal'
+      : selectedReasoningEffort.value
+  }
+
   function readOpenClawModelForThread(threadId: string): string {
     const selectedModel = readModelIdForThread(threadId)
     if (openClawModelIds.value.includes(selectedModel)) return selectedModel
@@ -1952,6 +1965,14 @@ export function useDesktopState() {
       openClawModelIds.value = modelIds
     } catch {
       // Keep OpenClaw usable even if model metadata is temporarily unavailable.
+    }
+  }
+
+  async function refreshOpenClawCommands(): Promise<void> {
+    try {
+      openClawCommands.value = await getOpenClawCommands()
+    } catch {
+      // Keep OpenClaw usable even if command metadata is temporarily unavailable.
     }
   }
 
@@ -4457,6 +4478,7 @@ export function useDesktopState() {
       refreshRateLimits(),
       refreshCollaborationModes(),
       refreshOpenClawModels(),
+      refreshOpenClawCommands(),
       refreshSkills(),
     ])
   }
@@ -4793,7 +4815,7 @@ export function useDesktopState() {
           fileAttachments,
           skills,
           readOpenClawModelForThread(threadId),
-          selectedReasoningEffort.value,
+          readOpenClawThinkingLevel(),
           {
           onSnapshot: (snapshot) => {
             upsertThreadInSourceGroups(snapshot.thread)
@@ -4976,7 +4998,7 @@ export function useDesktopState() {
           fileAttachments,
           skills,
           openClawModelIds.value.includes(selectedModel) ? selectedModel : openClawModelIds.value[0] ?? selectedModel,
-          selectedReasoningEffort.value,
+          readOpenClawThinkingLevel(),
         )
         threadId = result.thread.id
         sourceGroups.value = sourceGroups.value.map((group) => ({
@@ -5709,6 +5731,7 @@ export function useDesktopState() {
     availableCollaborationModes,
     availableModelIds,
     openClawModelIds,
+    openClawCommands,
     selectedCollaborationMode,
     selectedModelId,
     selectedReasoningEffort,
@@ -5756,6 +5779,7 @@ export function useDesktopState() {
 
     setSelectedReasoningEffort,
     updateSelectedSpeedMode,
+    setSelectedSpeedModeForOpenClaw,
     respondToPendingServerRequest,
     renameProject,
     removeProject,

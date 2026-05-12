@@ -5,6 +5,12 @@ export const OPENCLAW_THREAD_ID_PREFIX = 'openclaw::'
 
 type SkillParam = { name: string; path: string }
 
+export type OpenClawCommandInfo = {
+  name: string
+  description: string
+  source?: string
+}
+
 export function isOpenClawThreadId(threadId: string): boolean {
   return threadId.startsWith(OPENCLAW_THREAD_ID_PREFIX)
 }
@@ -206,6 +212,21 @@ export async function getOpenClawModelIds(): Promise<string[]> {
     .map((item) => typeof item.id === 'string' ? item.id.trim() : '')
     .filter(Boolean)
   return [...defaultModels, ...otherModels].filter((item, index, values) => values.indexOf(item) === index)
+}
+
+export async function getOpenClawCommands(): Promise<OpenClawCommandInfo[]> {
+  const payload = await fetchOpenClawJson<{ commands?: unknown }>('/codex-api/openclaw/commands')
+  if (!Array.isArray(payload.commands)) return []
+  return payload.commands
+    .map((item) => item && typeof item === 'object' ? item as Record<string, unknown> : null)
+    .filter((item): item is Record<string, unknown> => item !== null)
+    .map((item) => ({
+      name: typeof item.name === 'string' ? item.name.trim().replace(/^\/+/u, '') : '',
+      description: typeof item.description === 'string' ? item.description.trim() : '',
+      source: typeof item.source === 'string' ? item.source.trim() : undefined,
+    }))
+    .filter((item, index, values) =>
+      item.name.length > 0 && values.findIndex((candidate) => candidate.name === item.name) === index)
 }
 
 export async function getOpenClawThreadDetail(threadId: string): Promise<{

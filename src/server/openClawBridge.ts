@@ -25,6 +25,12 @@ type OpenClawAttachment = {
   fsPath?: string
 }
 
+type OpenClawCommandRow = {
+  name: string
+  description: string
+  source: string
+}
+
 function readString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
@@ -584,6 +590,40 @@ async function listConfiguredModels(): Promise<Array<{ id: string; name: string;
   })
 }
 
+async function listVisibleCommands(): Promise<OpenClawCommandRow[]> {
+  const output = await runOpenClaw(['skills', 'list', '--json'], 60_000)
+  const parsed = parseJsonObject(output)
+  const skills = Array.isArray(parsed.skills) ? parsed.skills : []
+  const commands = skills.flatMap((item) => {
+    const row = item && typeof item === 'object' && !Array.isArray(item)
+      ? item as Record<string, unknown>
+      : null
+    if (!row) return []
+    if (row.commandVisible !== true || row.userInvocable !== true) return []
+    const name = readString(row.name).replace(/^\/+/u, '')
+    if (!name) return []
+    return [{
+      name,
+      description: readString(row.description),
+      source: readString(row.source),
+    }]
+  })
+  const unique = new Map<string, OpenClawCommandRow>()
+  unique.set('commands', {
+    name: 'commands',
+    description: 'Show available OpenClaw commands',
+    source: 'native',
+  })
+  for (const command of commands) {
+    if (!unique.has(command.name)) unique.set(command.name, command)
+  }
+  return [...unique.values()].sort((a, b) => {
+    if (a.name === 'commands') return -1
+    if (b.name === 'commands') return 1
+    return a.name.localeCompare(b.name)
+  })
+}
+
 export function createOpenClawBridgeMiddleware(): RequestHandler {
   const router = express.Router()
 
@@ -646,6 +686,10 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
 
   router.get('/models', asyncHandler(async (_req, res) => {
     res.json({ models: await listConfiguredModels() })
+  }))
+
+  router.get('/commands', asyncHandler(async (_req, res) => {
+    res.json({ commands: await listVisibleCommands() })
   }))
 
   router.get('/threads/:threadId', asyncHandler(async (req, res) => {
