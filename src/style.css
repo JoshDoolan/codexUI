@@ -1003,11 +1003,14 @@
 
 :root.dark .review-pane-header,
 :root.dark .review-pane-toolbar,
+:root.dark .review-pane-content,
+:root.dark .review-pane-main,
+:root.dark .review-pane-diff,
 :root.dark .review-pane-hunk-header,
 :root.dark .review-pane-summary-card,
 :root.dark .review-pane-file-header,
 :root.dark .review-pane-hunk,
-:root.dark .review-pane-finding,
+:root.dark .review-pane-sheet-list,
 :root.dark .review-pane-sheet {
   @apply bg-zinc-900;
 }
@@ -1028,8 +1031,7 @@
 :root.dark .review-pane-empty-text,
 :root.dark .review-pane-file-subtitle,
 :root.dark .review-pane-hunk-meta,
-:root.dark .review-pane-finding-location,
-:root.dark .review-pane-finding-body {
+:root.dark .review-pane-hunk-title {
   @apply text-zinc-400;
 }
 
@@ -1074,7 +1076,6 @@
   @apply bg-white;
 }
 
-:root.dark .review-pane-run,
 :root.dark .review-pane-primary-cta {
   @apply border-emerald-500 bg-emerald-500 text-white hover:bg-emerald-400;
 }
@@ -1125,7 +1126,7 @@
 }
 
 :root.dark .review-pane-file {
-  @apply hover:border-zinc-600 hover:bg-zinc-800;
+  @apply text-zinc-100 hover:border-zinc-600 hover:bg-zinc-800;
 }
 
 :root.dark .review-pane-file[data-active='true'] {
@@ -1134,6 +1135,10 @@
 
 :root.dark .review-pane-file-path {
   @apply text-zinc-100;
+}
+
+:root.dark .review-pane-tree-folder-name {
+  @apply text-inherit;
 }
 
 :root.dark .review-pane-file-op[data-operation='update'] {
@@ -1171,8 +1176,7 @@
 
 :root.dark .review-pane-file-header,
 :root.dark .review-pane-hunk,
-:root.dark .review-pane-summary-card,
-:root.dark .review-pane-finding {
+:root.dark .review-pane-summary-card {
   @apply border-zinc-700;
 }
 
