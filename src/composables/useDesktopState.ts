@@ -1538,6 +1538,11 @@ export function useDesktopState() {
     }
   }
 
+  function isAppWindowActive(): boolean {
+    if (typeof document === 'undefined') return false
+    return document.visibilityState === 'visible' && document.hasFocus()
+  }
+
   function showBrowserThreadNotification(
     threadId: string,
     status: BrowserThreadNotificationStatus,
@@ -1545,6 +1550,7 @@ export function useDesktopState() {
   ): void {
     if (!threadId || !dedupeKey) return
     if (!browserThreadNotificationsAvailable()) return
+    if (isAppWindowActive()) return
     if (Notification.permission !== 'granted') return
     const key = `${status}:${dedupeKey}`
     if (shownBrowserNotificationKeys.has(key)) return
