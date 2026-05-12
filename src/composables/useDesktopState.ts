@@ -1953,10 +1953,8 @@ export function useDesktopState() {
       : selectedReasoningEffort.value
   }
 
-  function readOpenClawModelForThread(threadId: string): string {
-    const selectedModel = readModelIdForThread(threadId)
-    if (openClawModelIds.value.includes(selectedModel)) return selectedModel
-    return openClawModelIds.value[0] ?? selectedModel
+  function readOpenClawModelForThread(_threadId: string): string {
+    return ''
   }
 
   async function refreshOpenClawModels(): Promise<void> {
@@ -4997,7 +4995,7 @@ export function useDesktopState() {
           imageUrls,
           fileAttachments,
           skills,
-          openClawModelIds.value.includes(selectedModel) ? selectedModel : openClawModelIds.value[0] ?? selectedModel,
+          '',
           readOpenClawThinkingLevel(),
         )
         threadId = result.thread.id

@@ -496,7 +496,7 @@ async function sendToSession(session: OpenClawSessionRow, text: string, options:
 function appendRunOptions(args: string[], options: { model?: string; thinking?: string } = {}): string[] {
   const model = readString(options.model)
   const thinking = readString(options.thinking)
-  if (model) args.push('--model', model)
+  if (model && process.env.OPENCLAW_ALLOW_MODEL_OVERRIDE === '1') args.push('--model', model)
   if (thinking) args.push('--thinking', thinking)
   return args
 }
