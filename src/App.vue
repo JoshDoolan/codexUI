@@ -23,6 +23,29 @@
             </button>
           </SidebarThreadControls>
 
+          <div v-if="!isSidebarCollapsed" class="sidebar-source-switch" role="tablist" aria-label="Session source">
+            <button
+              class="sidebar-source-button"
+              :class="{ 'is-active': selectedSessionSource === 'codex' }"
+              type="button"
+              role="tab"
+              :aria-selected="selectedSessionSource === 'codex'"
+              @click="onSelectSessionSource('codex')"
+            >
+              Codex
+            </button>
+            <button
+              class="sidebar-source-button"
+              :class="{ 'is-active': selectedSessionSource === 'openclaw' }"
+              type="button"
+              role="tab"
+              :aria-selected="selectedSessionSource === 'openclaw'"
+              @click="onSelectSessionSource('openclaw')"
+            >
+              OpenClaw
+            </button>
+          </div>
+
           <div v-if="!isSidebarCollapsed && isSidebarSearchVisible" class="sidebar-search-bar">
             <IconTablerSearch class="sidebar-search-bar-icon" />
             <input
@@ -893,7 +916,7 @@
                   :cwd="composerCwd"
                   :collaboration-modes="availableCollaborationModes"
                   :selected-collaboration-mode="selectedCollaborationMode"
-                  :models="availableModelIds" :selected-model="composerSelectedModelId"
+                  :models="composerModelIds" :selected-model="composerSelectedModelId"
                   :selected-reasoning-effort="selectedReasoningEffort"
                   :selected-speed-mode="selectedSpeedMode"
                   :is-updating-speed-mode="isUpdatingSpeedMode"
@@ -969,7 +992,7 @@
                     :cwd="composerCwd"
                     :collaboration-modes="availableCollaborationModes"
                     :selected-collaboration-mode="selectedCollaborationMode"
-                    :models="availableModelIds"
+                    :models="composerModelIds"
                     :selected-model="composerSelectedModelId"
                     :selected-reasoning-effort="selectedReasoningEffort"
                     :selected-speed-mode="selectedSpeedMode"
@@ -1303,6 +1326,7 @@ const WHISPER_LANGUAGES: Record<string, string> = {
 const {
   projectGroups,
   projectDisplayNameById,
+  selectedSessionSource,
   selectedThread,
   selectedThreadTokenUsage,
   selectedThreadTerminalOpen,
@@ -1312,6 +1336,7 @@ const {
   selectedThreadId,
   availableCollaborationModes,
   availableModelIds,
+  openClawModelIds,
   selectedCollaborationMode,
   selectedModelId,
   selectedReasoningEffort,
@@ -1329,6 +1354,7 @@ const {
   isSelectedThreadInterruptPending,
   isUpdatingSpeedMode,
   refreshAll,
+  setSelectedSessionSource,
   refreshSkills,
   selectThread,
   ensureThreadMessagesLoaded,
@@ -1582,7 +1608,18 @@ const latestUserTurnId = computed(() => {
 })
 const liveOverlay = computed(() => selectedLiveOverlay.value)
 const composerThreadContextId = computed(() => (isHomeRoute.value ? '__new-thread__' : selectedThreadId.value))
-const composerSelectedModelId = computed(() => readModelIdForThread(composerThreadContextId.value))
+const composerModelIds = computed(() => (
+  selectedSessionSource.value === 'openclaw' && openClawModelIds.value.length > 0
+    ? openClawModelIds.value
+    : availableModelIds.value
+))
+const composerSelectedModelId = computed(() => {
+  const selectedModel = readModelIdForThread(composerThreadContextId.value)
+  if (selectedSessionSource.value !== 'openclaw') return selectedModel
+  return composerModelIds.value.includes(selectedModel)
+    ? selectedModel
+    : composerModelIds.value[0] ?? selectedModel
+})
 const selectedThreadPendingRequest = computed<UiServerRequest | null>(() => {
   const rows = selectedThreadServerRequests.value
   return rows.length > 0 ? rows[rows.length - 1] : null
@@ -2133,6 +2170,16 @@ function onSidebarSearchKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
     isSidebarSearchVisible.value = false
     sidebarSearchQuery.value = ''
+  }
+}
+
+async function onSelectSessionSource(source: 'codex' | 'openclaw'): Promise<void> {
+  if (selectedSessionSource.value === source) return
+  sidebarSearchQuery.value = ''
+  serverMatchedThreadIds.value = null
+  await setSelectedSessionSource(source)
+  if (!isHomeRoute.value) {
+    await router.push({ name: 'home' })
   }
 }
 
@@ -4485,6 +4532,18 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .sidebar-search-bar {
   @apply flex items-center gap-1.5 mx-2 px-2 py-1 rounded-md border border-zinc-200 bg-white transition-colors focus-within:border-zinc-400;
+}
+
+.sidebar-source-switch {
+  @apply mx-2 mb-1 grid grid-cols-2 gap-1 rounded-lg border border-zinc-200 bg-white p-1;
+}
+
+.sidebar-source-button {
+  @apply rounded-md px-2 py-1.5 text-xs font-semibold text-zinc-500 transition hover:bg-zinc-50 hover:text-zinc-900;
+}
+
+.sidebar-source-button.is-active {
+  @apply bg-zinc-900 text-white shadow-sm;
 }
 
 .sidebar-search-bar-icon {

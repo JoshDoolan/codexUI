@@ -37,6 +37,14 @@ import {
   type ThreadQueueState,
   type WorkspaceRootsState,
 } from '../api/codexGateway'
+import {
+  getOpenClawThreadDetail,
+  getOpenClawThreadGroupsPage,
+  getOpenClawModelIds,
+  isOpenClawThreadId,
+  startOpenClawThread,
+  startOpenClawThreadTurnStream,
+} from '../api/openClawGateway'
 import { normalizeFileChangeStatus, toUiFileChanges } from '../api/normalizers/v2'
 import type {
   CollaborationModeKind,
@@ -75,6 +83,7 @@ const UNREAD_CUTOFF_STORAGE_KEY = 'codex-web-local.thread-unread-cutoff.v1'
 const THREAD_TOKEN_USAGE_STORAGE_KEY = 'codex-web-local.thread-token-usage.v1'
 const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v1'
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
+const SELECTED_SESSION_SOURCE_STORAGE_KEY = 'codex-web-local.selected-session-source.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
@@ -91,6 +100,7 @@ const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
+export type SessionSourceMode = 'codex' | 'openclaw'
 
 function loadReadStateMap(): Record<string, string> {
   if (typeof window === 'undefined') return {}
@@ -110,6 +120,20 @@ function loadReadStateMap(): Record<string, string> {
 function saveReadStateMap(state: Record<string, string>): void {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(READ_STATE_STORAGE_KEY, JSON.stringify(state))
+}
+
+function normalizeSessionSourceMode(value: unknown): SessionSourceMode {
+  return value === 'openclaw' ? 'openclaw' : 'codex'
+}
+
+function loadSelectedSessionSource(): SessionSourceMode {
+  if (typeof window === 'undefined') return 'codex'
+  return normalizeSessionSourceMode(window.localStorage.getItem(SELECTED_SESSION_SOURCE_STORAGE_KEY))
+}
+
+function saveSelectedSessionSource(value: SessionSourceMode): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(SELECTED_SESSION_SOURCE_STORAGE_KEY, value)
 }
 
 function loadUnreadCutoffIso(): string {
@@ -1342,6 +1366,7 @@ export function filterGroupsByWorkspaceRoots(
 export function useDesktopState() {
   const projectGroups = ref<UiProjectGroup[]>([])
   const sourceGroups = ref<UiProjectGroup[]>([])
+  const selectedSessionSource = ref<SessionSourceMode>(loadSelectedSessionSource())
   const selectedThreadId = ref(loadSelectedThreadId())
   const persistedMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
@@ -1373,6 +1398,7 @@ export function useDesktopState() {
   let hasLoadedPersistedQueueState = false
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
+  const openClawModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
     { value: 'default', label: 'Default' },
     { value: 'plan', label: 'Plan' },
@@ -1914,6 +1940,21 @@ export function useDesktopState() {
     }
   }
 
+  function readOpenClawModelForThread(threadId: string): string {
+    const selectedModel = readModelIdForThread(threadId)
+    if (openClawModelIds.value.includes(selectedModel)) return selectedModel
+    return openClawModelIds.value[0] ?? selectedModel
+  }
+
+  async function refreshOpenClawModels(): Promise<void> {
+    try {
+      const modelIds = await getOpenClawModelIds()
+      openClawModelIds.value = modelIds
+    } catch {
+      // Keep OpenClaw usable even if model metadata is temporarily unavailable.
+    }
+  }
+
   async function refreshRateLimits(): Promise<void> {
     if (rateLimitRefreshPromise) {
       await rateLimitRefreshPromise
@@ -2069,6 +2110,27 @@ export function useDesktopState() {
     if (!areStringArraysEqual(projectOrder.value, nextProjectOrder)) {
       projectOrder.value = nextProjectOrder
       saveProjectOrder(projectOrder.value)
+    }
+    applyThreadFlags()
+  }
+
+  function upsertThreadInSourceGroups(thread: UiThread): void {
+    const projectName = thread.projectName || 'OpenClaw'
+    const existingGroupIndex = sourceGroups.value.findIndex((group) => group.projectName === projectName)
+    if (existingGroupIndex >= 0) {
+      const existingGroup = sourceGroups.value[existingGroupIndex]
+      let foundThread = false
+      const nextThreads = existingGroup.threads.map((existing) => {
+        if (existing.id !== thread.id) return existing
+        foundThread = true
+        return { ...existing, ...thread }
+      })
+      if (!foundThread) nextThreads.unshift(thread)
+      const nextGroups = [...sourceGroups.value]
+      nextGroups.splice(existingGroupIndex, 1, { projectName, threads: nextThreads })
+      sourceGroups.value = nextGroups
+    } else {
+      sourceGroups.value = [{ projectName, threads: [thread] }, ...sourceGroups.value]
     }
     applyThreadFlags()
   }
@@ -4129,7 +4191,25 @@ export function useDesktopState() {
       isLoadingThreads.value = true
     }
 
-    try {
+      try {
+      if (selectedSessionSource.value === 'openclaw') {
+        const page = await getOpenClawThreadGroupsPage()
+        loadedThreadListRootsState = null
+        loadedThreadListGroups = page.groups
+        threadListNextCursor = null
+        hasLoadedAllThreadPages = true
+        applyThreadGroups(page.groups, null)
+        hasLoadedThreads.value = true
+
+        const flatThreads = flattenThreads(projectGroups.value)
+        pruneThreadScopedState(flatThreads)
+        const currentExists = flatThreads.some((thread) => thread.id === selectedThreadId.value)
+        if (!currentExists) {
+          setSelectedThreadId(flatThreads[0]?.id ?? '')
+        }
+        return
+      }
+
       const [page, rootsState] = await Promise.all([
         getThreadGroupsPage(),
         loadWorkspaceRootsStateForThreadList(),
@@ -4190,6 +4270,19 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
+      if (isOpenClawThreadId(threadId)) {
+        const detail = await getOpenClawThreadDetail(threadId)
+        setPersistedMessagesForThread(threadId, detail.messages)
+        loadedMessagesByThreadId.value = {
+          ...loadedMessagesByThreadId.value,
+          [threadId]: true,
+        }
+        lastMessageLoadAtByThreadId.set(threadId, Date.now())
+        setThreadInProgress(threadId, detail.inProgress)
+        markThreadAsRead(threadId)
+        return
+      }
+
       const version = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
       const loadedRecently =
@@ -4363,6 +4456,7 @@ export function useDesktopState() {
       }),
       refreshRateLimits(),
       refreshCollaborationModes(),
+      refreshOpenClawModels(),
       refreshSkills(),
     ])
   }
@@ -4422,7 +4516,32 @@ export function useDesktopState() {
     }
   }
 
+  async function setSelectedSessionSource(source: SessionSourceMode): Promise<void> {
+    const normalizedSource = normalizeSessionSourceMode(source)
+    if (selectedSessionSource.value === normalizedSource) return
+    selectedSessionSource.value = normalizedSource
+    saveSelectedSessionSource(normalizedSource)
+    setSelectedThreadId('')
+    projectGroups.value = []
+    sourceGroups.value = []
+    persistedMessagesByThreadId.value = {}
+    livePlanMessagesByThreadId.value = {}
+    liveAgentMessagesByThreadId.value = {}
+    liveCommandsByThreadId.value = {}
+    liveFileChangeMessagesByThreadId.value = {}
+    loadedMessagesByThreadId.value = {}
+    loadedVersionByThreadId.value = {}
+    threadListNextCursor = null
+    hasLoadedThreads.value = false
+    hasLoadedAllThreadPages = false
+    await refreshAll({ includeSelectedThreadMessages: true })
+  }
+
   async function archiveThreadById(threadId: string) {
+    if (isOpenClawThreadId(threadId)) {
+      error.value = 'OpenClaw archiving is not implemented in this local dev adapter yet.'
+      return
+    }
     const wasSelectedThread = selectedThreadId.value === threadId
     const nextSelectedThreadId = wasSelectedThread
       ? findAdjacentThreadId(flattenThreads(projectGroups.value), threadId)
@@ -4449,6 +4568,10 @@ export function useDesktopState() {
   }
 
   async function renameThreadById(threadId: string, threadName: string) {
+    if (isOpenClawThreadId(threadId)) {
+      error.value = 'OpenClaw renaming is not implemented in this local dev adapter yet.'
+      return
+    }
     const normalizedName = threadName.trim()
     if (!threadId || !normalizedName) return
 
@@ -4463,6 +4586,10 @@ export function useDesktopState() {
   }
 
   async function forkThreadById(threadId: string): Promise<string> {
+    if (isOpenClawThreadId(threadId)) {
+      error.value = 'OpenClaw forking is not implemented in this local dev adapter yet.'
+      return ''
+    }
     const sourceThreadId = threadId.trim()
     if (!sourceThreadId) return ''
 
@@ -4494,6 +4621,10 @@ export function useDesktopState() {
   }
 
   async function forkThreadFromTurn(threadId: string, turnIndex: number): Promise<string> {
+    if (isOpenClawThreadId(threadId)) {
+      error.value = 'OpenClaw forking is not implemented in this local dev adapter yet.'
+      return ''
+    }
     const normalizedThreadId = threadId.trim()
     if (!normalizedThreadId || !Number.isInteger(turnIndex) || turnIndex < 0) return ''
 
@@ -4612,7 +4743,98 @@ export function useDesktopState() {
 
     const threadId = selectedThreadId.value
     const nextText = text.trim()
-    if (!threadId || (!nextText && imageUrls.length === 0 && fileAttachments.length === 0)) return
+    if (!threadId || (!nextText && imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0)) return
+
+    if (isOpenClawThreadId(threadId)) {
+      error.value = ''
+      shouldAutoScrollOnNextAgentEvent = true
+      const optimisticText = nextText || (
+        imageUrls.length > 0
+          ? 'Image attachment'
+            : fileAttachments.length > 0
+              ? 'File attachment'
+              : skills.length > 0
+                ? 'Skill selection'
+                : ''
+      )
+      const optimisticUserMessage: UiMessage = {
+        id: `openclaw-user-${Date.now()}`,
+        role: 'user',
+        text: optimisticText,
+      }
+      const baselineMessageIds = new Set((persistedMessagesByThreadId.value[threadId] ?? []).map((message) => message.id))
+      const mergeOpenClawStreamMessages = (incomingMessages: UiMessage[]): UiMessage[] => {
+        const hasUserMessage = incomingMessages.some((message) => (
+          message.role === 'user'
+          && (
+            message.text.trim() === nextText
+            || (optimisticText.length > 0 && message.text.includes(optimisticText))
+            || imageUrls.some((imageUrl) => message.text.includes(imageUrl))
+            || fileAttachments.some((attachment) => message.text.includes(attachment.path))
+            || skills.some((skill) => message.text.includes(skill.name) || message.text.includes(skill.path))
+          )
+        ))
+        return hasUserMessage ? incomingMessages : [...incomingMessages, optimisticUserMessage]
+      }
+      setPersistedMessagesForThread(threadId, [
+        ...(persistedMessagesByThreadId.value[threadId] ?? []),
+        optimisticUserMessage,
+      ])
+      setTurnActivityForThread(threadId, {
+        label: 'OpenClaw is working',
+        details: ['Waiting for tool calls and responses'],
+      })
+      setThreadInProgress(threadId, true)
+      try {
+        const result = await startOpenClawThreadTurnStream(
+          threadId,
+          nextText,
+          imageUrls,
+          fileAttachments,
+          skills,
+          readOpenClawModelForThread(threadId),
+          selectedReasoningEffort.value,
+          {
+          onSnapshot: (snapshot) => {
+            upsertThreadInSourceGroups(snapshot.thread)
+            setPersistedMessagesForThread(threadId, mergeOpenClawStreamMessages(snapshot.messages))
+            loadedMessagesByThreadId.value = {
+              ...loadedMessagesByThreadId.value,
+              [threadId]: true,
+            }
+            const latestCommand = [...snapshot.messages]
+              .reverse()
+              .find((message) => !baselineMessageIds.has(message.id) && message.messageType === 'commandExecution' && message.commandExecution)
+            if (latestCommand?.commandExecution) {
+              setTurnActivityForThread(threadId, {
+                label: latestCommand.commandExecution.status === 'inProgress' ? 'Running OpenClaw tool' : 'OpenClaw tool response',
+                details: [latestCommand.commandExecution.command],
+              })
+            }
+          },
+          onActivity: (activity) => {
+            setTurnActivityForThread(threadId, activity)
+          },
+          },
+        )
+        upsertThreadInSourceGroups(result.thread)
+        setPersistedMessagesForThread(threadId, result.messages)
+        loadedMessagesByThreadId.value = {
+          ...loadedMessagesByThreadId.value,
+          [threadId]: true,
+        }
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(threadId, null)
+      } catch (unknownError) {
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(threadId, null)
+        const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown OpenClaw error'
+        setTurnErrorForThread(threadId, errorMessage)
+        error.value = errorMessage
+        throw unknownError
+      }
+      return
+    }
 
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
       return
@@ -4718,13 +4940,63 @@ export function useDesktopState() {
     const targetCwd = cwd.trim()
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
-    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return ''
+    if (!nextText && imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0) return ''
 
     isSendingMessage.value = true
     error.value = ''
     let threadId = ''
 
     try {
+      if (selectedSessionSource.value === 'openclaw') {
+        const optimisticText = nextText || (
+          imageUrls.length > 0
+            ? 'Image attachment'
+            : fileAttachments.length > 0
+              ? 'File attachment'
+              : skills.length > 0
+                ? 'Skill selection'
+                : 'OpenClaw session'
+        )
+        const optimisticId = `openclaw::pending-${Date.now()}`
+        insertOptimisticThread(optimisticId, 'OpenClaw', optimisticText)
+        setSelectedThreadId(optimisticId)
+        setPersistedMessagesForThread(optimisticId, [{
+          id: `openclaw-user-${Date.now()}`,
+          role: 'user',
+          text: optimisticText,
+        }])
+        setTurnActivityForThread(optimisticId, {
+          label: 'OpenClaw is working',
+          details: ['Starting a new OpenClaw session'],
+        })
+        setThreadInProgress(optimisticId, true)
+        const result = await startOpenClawThread(
+          nextText,
+          imageUrls,
+          fileAttachments,
+          skills,
+          openClawModelIds.value.includes(selectedModel) ? selectedModel : openClawModelIds.value[0] ?? selectedModel,
+          selectedReasoningEffort.value,
+        )
+        threadId = result.thread.id
+        sourceGroups.value = sourceGroups.value.map((group) => ({
+          ...group,
+          threads: group.threads.filter((thread) => thread.id !== optimisticId),
+        }))
+        upsertThreadInSourceGroups(result.thread)
+        setSelectedThreadId(threadId)
+        setPersistedMessagesForThread(threadId, result.messages)
+        loadedMessagesByThreadId.value = {
+          ...loadedMessagesByThreadId.value,
+          [threadId]: true,
+        }
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(optimisticId, null)
+        setTurnActivityForThread(threadId, null)
+        isSendingMessage.value = false
+        return threadId
+      }
+
       try {
         const startedThread = await startThread(targetCwd || undefined, selectedModel || undefined)
         threadId = startedThread.threadId
@@ -4925,6 +5197,10 @@ export function useDesktopState() {
   }
 
   async function interruptSelectedThreadTurn(): Promise<void> {
+    if (isOpenClawThreadId(selectedThreadId.value)) {
+      error.value = 'OpenClaw interrupt is not implemented in this local dev adapter yet.'
+      return
+    }
     const threadId = selectedThreadId.value
     if (!threadId) return
     if (inProgressById.value[threadId] !== true) return
@@ -4967,6 +5243,10 @@ export function useDesktopState() {
   }
 
   async function rollbackSelectedThread(turnId: string): Promise<void> {
+    if (isOpenClawThreadId(selectedThreadId.value)) {
+      error.value = 'OpenClaw rollback is not implemented in this local dev adapter yet.'
+      return
+    }
     const threadId = selectedThreadId.value
     if (!threadId) return
     if (isRollingBack.value) return
@@ -5417,6 +5697,7 @@ export function useDesktopState() {
   return {
     projectGroups,
     projectDisplayNameById,
+    selectedSessionSource,
     selectedThread,
     selectedThreadTokenUsage,
     selectedThreadTerminalOpen,
@@ -5427,6 +5708,7 @@ export function useDesktopState() {
     selectedThreadId,
     availableCollaborationModes,
     availableModelIds,
+    openClawModelIds,
     selectedCollaborationMode,
     selectedModelId,
     selectedReasoningEffort,
@@ -5446,6 +5728,7 @@ export function useDesktopState() {
 
     error,
     refreshAll,
+    setSelectedSessionSource,
     refreshSkills,
     selectThread,
     loadMessages,

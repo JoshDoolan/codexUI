@@ -1155,9 +1155,10 @@ function removeSkill(path: string): void {
 }
 
 function skillMarkdownPath(path: string): string {
-  const trimmed = path.trim()
+  const trimmed = path.trim().replace(/[\\/]+$/u, '')
   if (!trimmed) return ''
-  return trimmed.endsWith('/SKILL.md') ? trimmed : `${trimmed.replace(/\/+$/, '')}/SKILL.md`
+  const deduped = trimmed.replace(/([\\/])SKILL\.md[\\/]SKILL\.md$/u, '$1SKILL.md')
+  return /[\\/]SKILL\.md$/u.test(deduped) ? deduped : `${deduped}/SKILL.md`
 }
 
 function openSkillMarkdown(skill: SkillItem): void {

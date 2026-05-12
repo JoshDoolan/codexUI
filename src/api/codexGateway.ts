@@ -1648,13 +1648,26 @@ function extractLocalImagePathFromUrl(value: string): string | null {
 function buildTextWithAttachments(
   prompt: string,
   files: FileAttachmentParam[],
+  skills: Array<{ name: string; path: string }> = [],
 ): string {
-  if (files.length === 0) return prompt
-  let prefix = '# Files mentioned by the user:\n'
-  for (const f of files) {
-    prefix += `\n## ${f.label}: ${f.path}\n`
+  if (files.length === 0 && skills.length === 0) return prompt
+  let prefix = ''
+  if (skills.length > 0) {
+    prefix += '# Skills selected by the user:\n'
+    for (const skill of skills) {
+      prefix += `\n## ${skill.name}\nSkill path: ${normalizeSkillMarkdownPath(skill.path)}\n`
+    }
+    prefix += '\nPlease read and follow the selected skill instructions where relevant.\n\n'
   }
-  return `${prefix}\n## My request for Codex:\n\n${prompt}\n`
+  if (files.length > 0) {
+    prefix += '# Files mentioned by the user:\n'
+    for (const f of files) {
+      prefix += `\n## ${f.label}: ${f.path}\n`
+    }
+    prefix += '\n'
+  }
+  const request = prompt.trim() || 'Please use the selected skill(s).'
+  return `${prefix}## My request for Codex:\n\n${request}\n`
 }
 
 function fileNameFromPath(pathValue: string): string {
@@ -1740,7 +1753,7 @@ export async function startThreadTurn(
     const allFileAttachments = [...fileAttachments, ...localImageAttachments]
     const dedupedFileAttachments = allFileAttachments.filter((entry, index) =>
       allFileAttachments.findIndex((candidate) => candidate.fsPath === entry.fsPath) === index)
-    const finalText = buildTextWithAttachments(text, dedupedFileAttachments)
+    const finalText = buildTextWithAttachments(text, dedupedFileAttachments, skills ?? [])
     const input: Array<Record<string, unknown>> = [{ type: 'text', text: finalText }]
     for (const imageUrl of imageUrls) {
       const normalizedUrl = imageUrl.trim()
@@ -1761,7 +1774,7 @@ export async function startThreadTurn(
     }
     if (skills) {
       for (const skill of skills) {
-        input.push({ type: 'skill', name: skill.name, path: skill.path })
+        input.push({ type: 'skill', name: skill.name, path: normalizeSkillMarkdownPath(skill.path) })
       }
     }
     const attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
@@ -3229,8 +3242,10 @@ export type SkillInfo = {
 }
 
 function normalizeSkillMarkdownPath(skillPath: string): string {
-  if (!skillPath) return ''
-  return skillPath.endsWith('/SKILL.md') ? skillPath : `${skillPath}/SKILL.md`
+  const trimmed = skillPath.trim().replace(/[\\/]+$/u, '')
+  if (!trimmed) return ''
+  const deduped = trimmed.replace(/([\\/])SKILL\.md[\\/]SKILL\.md$/u, '$1SKILL.md')
+  return /[\\/]SKILL\.md$/u.test(deduped) ? deduped : `${deduped}/SKILL.md`
 }
 
 function deriveGroupedSkillRoot(
