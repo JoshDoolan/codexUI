@@ -167,7 +167,7 @@
                     <span v-else-if="branch.isRemote" class="header-git-branch-meta">remote</span>
                   </button>
                   <button
-                    v-if="branch.value === selectedBranch && branch.value !== currentBranch"
+                    v-if="branch.value === selectedBranch && branch.value !== currentBranch && !branch.isRemote"
                     class="header-git-branch-checkout"
                     type="button"
                     :disabled="busy"
@@ -367,6 +367,8 @@ function openCommitFile(filePath: string): void {
   isOpen.value = false
   searchQuery.value = ''
   commitSearchQuery.value = ''
+  selectedCommitSha.value = ''
+  copiedCommitSha.value = ''
 }
 
 function onEscapeSearch(): void {
@@ -375,6 +377,8 @@ function onEscapeSearch(): void {
     return
   }
   isOpen.value = false
+  selectedCommitSha.value = ''
+  copiedCommitSha.value = ''
 }
 
 function onEscapeCommitSearch(): void {
@@ -383,6 +387,8 @@ function onEscapeCommitSearch(): void {
     return
   }
   isOpen.value = false
+  selectedCommitSha.value = ''
+  copiedCommitSha.value = ''
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {

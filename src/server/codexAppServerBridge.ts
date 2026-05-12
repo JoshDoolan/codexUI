@@ -2800,6 +2800,10 @@ async function ensureRepoHasInitialCommit(repoRoot: string): Promise<void> {
 }
 
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
+  return (await runCommandCaptureRaw(command, args, options)).trim()
+}
+
+async function runCommandCaptureRaw(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const proc = spawn(command, args, {
       cwd: options.cwd,
@@ -2813,7 +2817,7 @@ async function runCommandCapture(command: string, args: string[], options: { cwd
     proc.on('error', reject)
     proc.on('close', (code) => {
       if (code === 0) {
-        resolve(stdout.trim())
+        resolve(stdout)
         return
       }
       const details = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n')
@@ -2845,8 +2849,7 @@ async function assertLocalGitBranch(repoRoot: string, branchName: string): Promi
 function splitGitPathList(raw: string): string[] {
   return raw
     .split('\0')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
+    .filter((entry) => entry.length > 0)
 }
 
 function isSafeGitRelativePath(filePath: string): boolean {
@@ -2859,8 +2862,8 @@ function resolveGitRelativePath(repoRoot: string, filePath: string): string {
 
 async function preserveUntrackedFilesForGitTarget(repoRoot: string, targetRef: string): Promise<string[]> {
   const [untrackedRaw, targetTreeRaw] = await Promise.all([
-    runCommandCapture('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot }),
-    runCommandCapture('git', ['ls-tree', '-r', '--name-only', '-z', `${targetRef}^{tree}`], { cwd: repoRoot }),
+    runCommandCaptureRaw('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot }),
+    runCommandCaptureRaw('git', ['ls-tree', '-r', '--name-only', '-z', `${targetRef}^{tree}`], { cwd: repoRoot }),
   ])
   const targetPaths = new Set(splitGitPathList(targetTreeRaw))
   const conflictingUntrackedPaths = splitGitPathList(untrackedRaw)
@@ -6947,6 +6950,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         try {
           const gitRoot = await runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd })
           await assertNoTrackedGitChanges(gitRoot)
+          await assertLocalGitBranch(gitRoot, targetBranch)
           await checkoutGitBranchWithWorktreeRecovery(gitRoot, targetBranch)
           setJson(res, 200, { data: await readGitHeaderState(gitRoot) })
         } catch (error) {
