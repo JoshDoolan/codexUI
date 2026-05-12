@@ -809,6 +809,8 @@ type TurnCompletedInfo = {
   startedAtMs?: number
 }
 
+type BrowserThreadNotificationStatus = 'completed' | 'failed'
+
 const WORKED_MESSAGE_TYPE = 'worked'
 
 function parseIsoTimestamp(value: string): number | null {
@@ -1508,6 +1510,7 @@ export function useDesktopState() {
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
+  const shownBrowserNotificationKeys = new Set<string>()
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1518,6 +1521,60 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return Boolean(threadId && terminalOpenByThreadId.value[threadId] === true)
   })
+
+  function browserThreadNotificationsAvailable(): boolean {
+    return typeof window !== 'undefined'
+      && typeof Notification !== 'undefined'
+      && window.isSecureContext
+  }
+
+  async function ensureBrowserThreadNotificationPermission(): Promise<void> {
+    if (!browserThreadNotificationsAvailable()) return
+    if (Notification.permission !== 'default') return
+    try {
+      await Notification.requestPermission()
+    } catch {
+      // Browser notification permission is best-effort.
+    }
+  }
+
+  function showBrowserThreadNotification(
+    threadId: string,
+    status: BrowserThreadNotificationStatus,
+    dedupeKey: string,
+  ): void {
+    if (!threadId || !dedupeKey) return
+    if (!browserThreadNotificationsAvailable()) return
+    if (Notification.permission !== 'granted') return
+    const key = `${status}:${dedupeKey}`
+    if (shownBrowserNotificationKeys.has(key)) return
+    shownBrowserNotificationKeys.add(key)
+
+    const thread = allThreads.value.find((item) => item.id === threadId)
+    const threadTitle = thread?.title?.trim() || thread?.preview?.trim() || 'Thread'
+    const source = isOpenClawThreadId(threadId) ? 'OpenClaw' : 'Codex'
+    const title = status === 'failed'
+      ? `${source} needs attention`
+      : `${source} thread finished`
+    const body = status === 'failed'
+      ? threadTitle
+      : `${threadTitle} is ready.`
+
+    try {
+      const notification = new Notification(title, {
+        body,
+        tag: key,
+      })
+      notification.onclick = () => {
+        window.focus()
+        setSelectedThreadId(threadId)
+        notification.close()
+      }
+    } catch {
+      // Ignore browser/runtime notification failures.
+    }
+  }
+
   const isSelectedThreadInterruptPending = computed(() => {
     const threadId = selectedThreadId.value
     if (!threadId) return false
@@ -3733,6 +3790,11 @@ export function useDesktopState() {
       setTurnActivityForThread(completedTurn.threadId, null)
       markThreadUnreadByEvent(completedTurn.threadId)
       if (!shouldRetryWithFallback) {
+        showBrowserThreadNotification(
+          completedTurn.threadId,
+          turnErrorMessage ? 'failed' : 'completed',
+          `codex:${completedTurn.threadId}:${completedTurn.turnId}`,
+        )
         clearPendingTurnRequest(completedTurn.threadId)
         scheduleQueueStateRefresh(completedTurn.threadId)
       }
@@ -4764,6 +4826,7 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     const nextText = text.trim()
     if (!threadId || (!nextText && imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0)) return
+    void ensureBrowserThreadNotificationPermission()
 
     if (isOpenClawThreadId(threadId)) {
       error.value = ''
@@ -4845,12 +4908,14 @@ export function useDesktopState() {
         }
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
+        showBrowserThreadNotification(threadId, 'completed', `openclaw:${threadId}:${Date.now()}`)
       } catch (unknownError) {
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown OpenClaw error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
+        showBrowserThreadNotification(threadId, 'failed', `openclaw-error:${threadId}:${Date.now()}`)
         throw unknownError
       }
       return
@@ -4902,6 +4967,7 @@ export function useDesktopState() {
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
+        showBrowserThreadNotification(threadId, 'failed', `codex-error:${threadId}:${Date.now()}`)
       })
       return
     }
@@ -4943,6 +5009,7 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
+      showBrowserThreadNotification(threadId, 'failed', `codex-error:${threadId}:${Date.now()}`)
       throw unknownError
     }
   }
@@ -4961,6 +5028,7 @@ export function useDesktopState() {
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
     if (!nextText && imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0) return ''
+    void ensureBrowserThreadNotificationPermission()
 
     isSendingMessage.value = true
     error.value = ''
@@ -4978,6 +5046,7 @@ export function useDesktopState() {
                 : 'OpenClaw session'
         )
         const optimisticId = `openclaw::pending-${Date.now()}`
+        threadId = optimisticId
         insertOptimisticThread(optimisticId, 'OpenClaw', optimisticText)
         setSelectedThreadId(optimisticId)
         setPersistedMessagesForThread(optimisticId, [{
@@ -5013,6 +5082,7 @@ export function useDesktopState() {
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(optimisticId, null)
         setTurnActivityForThread(threadId, null)
+        showBrowserThreadNotification(threadId, 'completed', `openclaw:${threadId}:${Date.now()}`)
         isSendingMessage.value = false
         return threadId
       }
@@ -5068,6 +5138,7 @@ export function useDesktopState() {
           const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
           setTurnErrorForThread(threadId, errorMessage)
           error.value = errorMessage
+          showBrowserThreadNotification(threadId, 'failed', `codex-error:${threadId}:${Date.now()}`)
         })
         .finally(() => {
           isSendingMessage.value = false
@@ -5083,6 +5154,7 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       if (threadId) {
         setTurnErrorForThread(threadId, errorMessage)
+        showBrowserThreadNotification(threadId, 'failed', `thread-error:${threadId}:${Date.now()}`)
       }
       error.value = errorMessage
       isSendingMessage.value = false
