@@ -282,21 +282,33 @@ function parseSessionStore(value: Record<string, unknown>, agentId: string): Ope
   return rows
 }
 
+function readConfiguredAgentIds(config: Record<string, unknown> | null): Set<string> {
+  const configuredAgentIds = new Set<string>()
+  const agents = config?.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)
+    ? config.agents as Record<string, unknown>
+    : {}
+  const agentList = Array.isArray(agents.list) ? agents.list : []
+  for (const entry of agentList) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const id = readString((entry as Record<string, unknown>).id)
+    if (id) configuredAgentIds.add(id)
+  }
+
+  const fallbackAgents = ['ari-super', 'ari-ops', 'family-finance', 'pat-super', 'pat-ops']
+  for (const agentId of fallbackAgents) {
+    if (existsSync(join(getOpenClawHome(), 'agents', agentId, 'sessions', 'sessions.json'))) {
+      configuredAgentIds.add(agentId)
+    }
+  }
+  return configuredAgentIds
+}
+
 async function listLocalSessions(limit = 100): Promise<OpenClawSessionRow[]> {
   const openClawHome = getOpenClawHome()
   if (!openClawHome) return []
 
   const config = await readJsonFile(join(openClawHome, 'openclaw.json'))
-  const configuredAgentIds = new Set<string>()
-  const agents = config?.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)
-    ? config.agents as Record<string, unknown>
-    : {}
-  for (const agentId of Object.keys(agents)) {
-    if (agentId.trim()) configuredAgentIds.add(agentId.trim())
-  }
-
-  const defaultAgents = ['ari-super', 'ari-ops', 'family-finance', 'pat-super', 'pat-ops', 'codex']
-  for (const agentId of defaultAgents) configuredAgentIds.add(agentId)
+  const configuredAgentIds = readConfiguredAgentIds(config)
 
   const sessions: OpenClawSessionRow[] = []
   for (const agentId of configuredAgentIds) {
