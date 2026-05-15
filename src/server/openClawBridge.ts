@@ -31,6 +31,18 @@ type OpenClawCommandRow = {
   source: string
 }
 
+type OpenClawModelRow = {
+  id: string
+  name: string
+  isDefault: boolean
+}
+
+const OPENCLAW_METADATA_CACHE_TTL_MS = 10 * 60 * 1000
+let cachedModels: { rows: OpenClawModelRow[]; atMs: number } | null = null
+let cachedCommands: { rows: OpenClawCommandRow[]; atMs: number } | null = null
+let modelsRefreshPromise: Promise<OpenClawModelRow[]> | null = null
+let commandsRefreshPromise: Promise<OpenClawCommandRow[]> | null = null
+
 function readString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
@@ -569,8 +581,12 @@ function normalizeThinking(value: string): string {
   return value === 'none' ? 'off' : value
 }
 
-async function listConfiguredModels(): Promise<Array<{ id: string; name: string; isDefault: boolean }>> {
-  const output = await runOpenClaw(['models', 'list', '--json'], 60_000)
+function isFreshMetadataCache(atMs: number): boolean {
+  return Date.now() - atMs < OPENCLAW_METADATA_CACHE_TTL_MS
+}
+
+async function readConfiguredModels(): Promise<OpenClawModelRow[]> {
+  const output = await runOpenClaw(['models', 'list', '--json'], 20_000)
   const parsed = parseJsonObject(output)
   const models = Array.isArray(parsed.models) ? parsed.models : []
   return models.flatMap((item) => {
@@ -590,8 +606,27 @@ async function listConfiguredModels(): Promise<Array<{ id: string; name: string;
   })
 }
 
-async function listVisibleCommands(): Promise<OpenClawCommandRow[]> {
-  const output = await runOpenClaw(['skills', 'list', '--json'], 60_000)
+async function listConfiguredModels(): Promise<OpenClawModelRow[]> {
+  if (cachedModels && isFreshMetadataCache(cachedModels.atMs)) return cachedModels.rows
+  if (modelsRefreshPromise) return modelsRefreshPromise
+
+  modelsRefreshPromise = readConfiguredModels()
+    .then((rows) => {
+      cachedModels = { rows, atMs: Date.now() }
+      return rows
+    })
+    .catch((error) => {
+      if (cachedModels) return cachedModels.rows
+      throw error
+    })
+    .finally(() => {
+      modelsRefreshPromise = null
+    })
+  return modelsRefreshPromise
+}
+
+async function readVisibleCommands(): Promise<OpenClawCommandRow[]> {
+  const output = await runOpenClaw(['skills', 'list', '--json'], 20_000)
   const parsed = parseJsonObject(output)
   const skills = Array.isArray(parsed.skills) ? parsed.skills : []
   const commands = skills.flatMap((item) => {
@@ -622,6 +657,25 @@ async function listVisibleCommands(): Promise<OpenClawCommandRow[]> {
     if (b.name === 'commands') return 1
     return a.name.localeCompare(b.name)
   })
+}
+
+async function listVisibleCommands(): Promise<OpenClawCommandRow[]> {
+  if (cachedCommands && isFreshMetadataCache(cachedCommands.atMs)) return cachedCommands.rows
+  if (commandsRefreshPromise) return commandsRefreshPromise
+
+  commandsRefreshPromise = readVisibleCommands()
+    .then((rows) => {
+      cachedCommands = { rows, atMs: Date.now() }
+      return rows
+    })
+    .catch((error) => {
+      if (cachedCommands) return cachedCommands.rows
+      throw error
+    })
+    .finally(() => {
+      commandsRefreshPromise = null
+    })
+  return commandsRefreshPromise
 }
 
 export function createOpenClawBridgeMiddleware(): RequestHandler {

@@ -1495,6 +1495,10 @@ export function useDesktopState() {
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
   let refreshSkillsPromise: Promise<void> | null = null
+  let refreshOpenClawModelsPromise: Promise<void> | null = null
+  let refreshOpenClawCommandsPromise: Promise<void> | null = null
+  let lastOpenClawModelsRefreshMs = 0
+  let lastOpenClawCommandsRefreshMs = 0
   let rateLimitRefreshPromise: Promise<void> | null = null
   let pendingThreadsRefresh = false
   const pendingThreadMessageRefresh = new Set<string>()
@@ -2021,20 +2025,48 @@ export function useDesktopState() {
   }
 
   async function refreshOpenClawModels(): Promise<void> {
-    try {
-      const modelIds = await getOpenClawModelIds()
-      openClawModelIds.value = modelIds
-    } catch {
-      // Keep OpenClaw usable even if model metadata is temporarily unavailable.
+    const now = Date.now()
+    if (openClawModelIds.value.length > 0 && now - lastOpenClawModelsRefreshMs < 10 * 60 * 1000) return
+    if (refreshOpenClawModelsPromise) {
+      await refreshOpenClawModelsPromise
+      return
     }
+
+    refreshOpenClawModelsPromise = (async () => {
+      try {
+        const modelIds = await getOpenClawModelIds()
+        openClawModelIds.value = modelIds
+        lastOpenClawModelsRefreshMs = Date.now()
+      } catch {
+        // Keep OpenClaw usable even if model metadata is temporarily unavailable.
+      } finally {
+        refreshOpenClawModelsPromise = null
+      }
+    })()
+
+    await refreshOpenClawModelsPromise
   }
 
   async function refreshOpenClawCommands(): Promise<void> {
-    try {
-      openClawCommands.value = await getOpenClawCommands()
-    } catch {
-      // Keep OpenClaw usable even if command metadata is temporarily unavailable.
+    const now = Date.now()
+    if (openClawCommands.value.length > 0 && now - lastOpenClawCommandsRefreshMs < 10 * 60 * 1000) return
+    if (refreshOpenClawCommandsPromise) {
+      await refreshOpenClawCommandsPromise
+      return
     }
+
+    refreshOpenClawCommandsPromise = (async () => {
+      try {
+        openClawCommands.value = await getOpenClawCommands()
+        lastOpenClawCommandsRefreshMs = Date.now()
+      } catch {
+        // Keep OpenClaw usable even if command metadata is temporarily unavailable.
+      } finally {
+        refreshOpenClawCommandsPromise = null
+      }
+    })()
+
+    await refreshOpenClawCommandsPromise
   }
 
   async function refreshRateLimits(): Promise<void> {
