@@ -38,10 +38,13 @@ import {
   type WorkspaceRootsState,
 } from '../api/codexGateway'
 import {
+  getOpenClawAgents,
   getOpenClawCommands,
   getOpenClawThreadDetail,
   getOpenClawThreadGroupsPage,
   getOpenClawModelIds,
+  renameOpenClawThread,
+  type OpenClawAgentInfo,
   type OpenClawCommandInfo,
   isOpenClawThreadId,
   startOpenClawThread,
@@ -86,6 +89,7 @@ const THREAD_TOKEN_USAGE_STORAGE_KEY = 'codex-web-local.thread-token-usage.v1'
 const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v1'
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
 const SELECTED_SESSION_SOURCE_STORAGE_KEY = 'codex-web-local.selected-session-source.v1'
+const SELECTED_OPENCLAW_AGENT_STORAGE_KEY = 'codex-web-local.selected-openclaw-agent-id.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
@@ -136,6 +140,16 @@ function loadSelectedSessionSource(): SessionSourceMode {
 function saveSelectedSessionSource(value: SessionSourceMode): void {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(SELECTED_SESSION_SOURCE_STORAGE_KEY, value)
+}
+
+function loadSelectedOpenClawAgentId(): string {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(SELECTED_OPENCLAW_AGENT_STORAGE_KEY)?.trim() ?? ''
+}
+
+function saveSelectedOpenClawAgentId(value: string): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(SELECTED_OPENCLAW_AGENT_STORAGE_KEY, value)
 }
 
 function loadUnreadCutoffIso(): string {
@@ -1402,6 +1416,8 @@ export function useDesktopState() {
   let hasLoadedPersistedQueueState = false
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
+  const openClawAgents = ref<OpenClawAgentInfo[]>([])
+  const selectedOpenClawAgentId = ref(loadSelectedOpenClawAgentId())
   const openClawModelIds = ref<string[]>([])
   const openClawCommands = ref<OpenClawCommandInfo[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -1495,8 +1511,10 @@ export function useDesktopState() {
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
   let refreshSkillsPromise: Promise<void> | null = null
+  let refreshOpenClawAgentsPromise: Promise<void> | null = null
   let refreshOpenClawModelsPromise: Promise<void> | null = null
   let refreshOpenClawCommandsPromise: Promise<void> | null = null
+  let lastOpenClawAgentsRefreshMs = 0
   let lastOpenClawModelsRefreshMs = 0
   let lastOpenClawCommandsRefreshMs = 0
   let rateLimitRefreshPromise: Promise<void> | null = null
@@ -2020,8 +2038,65 @@ export function useDesktopState() {
       : selectedReasoningEffort.value
   }
 
-  function readOpenClawModelForThread(_threadId: string): string {
+  function isOpenClawOauthModelId(modelId: string): boolean {
+    const normalized = modelId.trim().toLowerCase()
+    return normalized.startsWith('openai/')
+      || normalized.startsWith('openai-codex/')
+      || normalized.startsWith('codex/')
+  }
+
+  function inferOpenClawOauthModelId(rawModel: string): string {
+    const model = rawModel.trim()
+    if (!model) return ''
+    if (isOpenClawOauthModelId(model)) return model
+    for (const candidate of [`openai/${model}`, `openai-codex/${model}`, `codex/${model}`]) {
+      if (openClawModelIds.value.includes(candidate)) return candidate
+    }
     return ''
+  }
+
+  function readOpenClawModelForThread(threadId: string): string {
+    const modelId = readModelIdForThread(threadId).trim()
+    if (isOpenClawOauthModelId(modelId)) return modelId
+    const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
+    return inferOpenClawOauthModelId(thread?.preview ?? '')
+  }
+
+  function setSelectedOpenClawAgentId(agentId: string): void {
+    const normalized = agentId.trim()
+    selectedOpenClawAgentId.value = normalized
+    saveSelectedOpenClawAgentId(normalized)
+  }
+
+  function reconcileSelectedOpenClawAgent(): void {
+    const agents = openClawAgents.value
+    if (agents.length === 0) return
+    if (selectedOpenClawAgentId.value && agents.some((agent) => agent.id === selectedOpenClawAgentId.value)) return
+    const defaultAgent = agents.find((agent) => agent.isDefault) ?? agents[0]
+    setSelectedOpenClawAgentId(defaultAgent?.id ?? '')
+  }
+
+  async function refreshOpenClawAgents(): Promise<void> {
+    const now = Date.now()
+    if (openClawAgents.value.length > 0 && now - lastOpenClawAgentsRefreshMs < 10 * 60 * 1000) return
+    if (refreshOpenClawAgentsPromise) {
+      await refreshOpenClawAgentsPromise
+      return
+    }
+
+    refreshOpenClawAgentsPromise = (async () => {
+      try {
+        openClawAgents.value = await getOpenClawAgents()
+        reconcileSelectedOpenClawAgent()
+        lastOpenClawAgentsRefreshMs = Date.now()
+      } catch {
+        // Keep OpenClaw usable even if agent metadata is temporarily unavailable.
+      } finally {
+        refreshOpenClawAgentsPromise = null
+      }
+    })()
+
+    await refreshOpenClawAgentsPromise
   }
 
   async function refreshOpenClawModels(): Promise<void> {
@@ -4575,6 +4650,7 @@ export function useDesktopState() {
       }),
       refreshRateLimits(),
       refreshCollaborationModes(),
+      refreshOpenClawAgents(),
       refreshOpenClawModels(),
       refreshOpenClawCommands(),
       refreshSkills(),
@@ -4688,14 +4764,17 @@ export function useDesktopState() {
   }
 
   async function renameThreadById(threadId: string, threadName: string) {
-    if (isOpenClawThreadId(threadId)) {
-      error.value = 'OpenClaw renaming is not implemented in this local dev adapter yet.'
-      return
-    }
     const normalizedName = threadName.trim()
     if (!threadId || !normalizedName) return
 
     try {
+      if (isOpenClawThreadId(threadId)) {
+        const renamedThread = await renameOpenClawThread(threadId, normalizedName)
+        upsertThreadInSourceGroups(renamedThread)
+        threadTitleById.value = { ...threadTitleById.value, [threadId]: normalizedName }
+        applyThreadFlags()
+        return
+      }
       await renameThread(threadId, normalizedName)
       threadTitleById.value = { ...threadTitleById.value, [threadId]: normalizedName }
       applyThreadFlags()
@@ -4915,6 +4994,7 @@ export function useDesktopState() {
           skills,
           readOpenClawModelForThread(threadId),
           readOpenClawThinkingLevel(),
+          selectedSpeedMode.value === 'fast',
           {
           onSnapshot: (snapshot) => {
             upsertThreadInSourceGroups(snapshot.thread)
@@ -5102,10 +5182,15 @@ export function useDesktopState() {
           imageUrls,
           fileAttachments,
           skills,
-          '',
+          selectedModel,
           readOpenClawThinkingLevel(),
+          selectedOpenClawAgentId.value,
+          selectedSpeedMode.value === 'fast',
         )
         threadId = result.thread.id
+        if (isOpenClawOauthModelId(selectedModel)) {
+          setThreadModelId(threadId, selectedModel)
+        }
         sourceGroups.value = sourceGroups.value.map((group) => ({
           ...group,
           threads: group.threads.filter((thread) => thread.id !== optimisticId),
@@ -5838,6 +5923,8 @@ export function useDesktopState() {
     selectedThreadId,
     availableCollaborationModes,
     availableModelIds,
+    openClawAgents,
+    selectedOpenClawAgentId,
     openClawModelIds,
     openClawCommands,
     selectedCollaborationMode,
@@ -5860,6 +5947,7 @@ export function useDesktopState() {
     error,
     refreshAll,
     setSelectedSessionSource,
+    setSelectedOpenClawAgentId,
     refreshSkills,
     selectThread,
     loadMessages,

@@ -11,6 +11,13 @@ export type OpenClawCommandInfo = {
   source?: string
 }
 
+export type OpenClawAgentInfo = {
+  id: string
+  name: string
+  isDefault: boolean
+  primaryModel: string
+}
+
 export function isOpenClawThreadId(threadId: string): boolean {
   return threadId.startsWith(OPENCLAW_THREAD_ID_PREFIX)
 }
@@ -106,12 +113,13 @@ function extractLocalImagePathFromUrl(value: string): string | null {
 async function stageOpenClawAttachments(
   threadId: string | null,
   attachments: FileAttachmentParam[],
+  agentId = '',
 ): Promise<FileAttachmentParam[]> {
   if (attachments.length === 0) return []
   const payload = await fetchOpenClawJson<{ attachments?: unknown }>('/codex-api/openclaw/stage-attachments', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId, attachments }),
+    body: JSON.stringify({ threadId, attachments, agentId }),
   })
   return Array.isArray(payload.attachments)
     ? payload.attachments
@@ -135,6 +143,7 @@ async function buildOpenClawTextWithAttachments(
   fileAttachments: FileAttachmentParam[] = [],
   skills: SkillParam[] = [],
   threadId: string | null = null,
+  agentId = '',
 ): Promise<string> {
   const attachments: FileAttachmentParam[] = [...fileAttachments]
   for (const imageUrl of imageUrls) {
@@ -159,7 +168,7 @@ async function buildOpenClawTextWithAttachments(
   const deduped = attachments.filter((entry, index) =>
     attachments.findIndex((candidate) => candidate.fsPath === entry.fsPath) === index)
   const trimmedText = text.trim()
-  const staged = await stageOpenClawAttachments(threadId, deduped)
+  const staged = await stageOpenClawAttachments(threadId, deduped, agentId)
 
   let prefix = ''
   if (skills.length > 0) {
@@ -203,6 +212,10 @@ export async function getOpenClawModelIds(): Promise<string[]> {
   const rows = payload.models
     .map((item) => item && typeof item === 'object' ? item as Record<string, unknown> : null)
     .filter((item): item is Record<string, unknown> => item !== null)
+    .filter((item) => {
+      const id = typeof item.id === 'string' ? item.id.trim().toLowerCase() : ''
+      return !id.startsWith('openrouter/')
+    })
   const defaultModels = rows
     .filter((item) => item.isDefault === true)
     .map((item) => typeof item.id === 'string' ? item.id.trim() : '')
@@ -212,6 +225,24 @@ export async function getOpenClawModelIds(): Promise<string[]> {
     .map((item) => typeof item.id === 'string' ? item.id.trim() : '')
     .filter(Boolean)
   return [...defaultModels, ...otherModels].filter((item, index, values) => values.indexOf(item) === index)
+}
+
+export async function getOpenClawAgents(): Promise<OpenClawAgentInfo[]> {
+  const payload = await fetchOpenClawJson<{ agents?: unknown }>('/codex-api/openclaw/agents')
+  if (!Array.isArray(payload.agents)) return []
+  return payload.agents
+    .map((item) => item && typeof item === 'object' ? item as Record<string, unknown> : null)
+    .filter((item): item is Record<string, unknown> => item !== null)
+    .map((item) => ({
+      id: typeof item.id === 'string' ? item.id.trim() : '',
+      name: typeof item.name === 'string' && item.name.trim()
+        ? item.name.trim()
+        : typeof item.id === 'string' ? item.id.trim() : '',
+      isDefault: item.isDefault === true,
+      primaryModel: typeof item.primaryModel === 'string' ? item.primaryModel.trim() : '',
+    }))
+    .filter((item, index, values) =>
+      item.id.length > 0 && values.findIndex((candidate) => candidate.id === item.id) === index)
 }
 
 export async function getOpenClawCommands(): Promise<OpenClawCommandInfo[]> {
@@ -251,6 +282,20 @@ export async function getOpenClawThreadDetail(threadId: string): Promise<{
   }
 }
 
+export async function renameOpenClawThread(threadId: string, threadName: string): Promise<UiThread> {
+  const payload = await fetchOpenClawJson<{ thread?: unknown }>(
+    `/codex-api/openclaw/threads/${encodeURIComponent(threadId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: threadName }),
+    },
+  )
+  const thread = normalizeThread(payload.thread)
+  if (!thread) throw new Error('OpenClaw rename returned an invalid thread')
+  return thread
+}
+
 export async function startOpenClawThread(
   text: string,
   imageUrls: string[] = [],
@@ -258,12 +303,14 @@ export async function startOpenClawThread(
   skills: SkillParam[] = [],
   model = '',
   thinking = '',
+  agentId = '',
+  fastMode = false,
 ): Promise<{ thread: UiThread; messages: UiMessage[] }> {
-  const finalText = await buildOpenClawTextWithAttachments(text, imageUrls, fileAttachments, skills)
+  const finalText = await buildOpenClawTextWithAttachments(text, imageUrls, fileAttachments, skills, null, agentId)
   const payload = await fetchOpenClawJson<{ thread?: unknown; messages?: unknown }>('/codex-api/openclaw/threads', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: finalText, model, thinking }),
+    body: JSON.stringify({ text: finalText, model, thinking, agentId, fastMode }),
   })
   const thread = normalizeThread(payload.thread)
   if (!thread) throw new Error('OpenClaw did not return a thread')
@@ -283,6 +330,7 @@ export async function startOpenClawThreadTurn(
   skills: SkillParam[] = [],
   model = '',
   thinking = '',
+  fastMode = false,
 ): Promise<{
   thread: UiThread
   messages: UiMessage[]
@@ -293,7 +341,7 @@ export async function startOpenClawThreadTurn(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: finalText, model, thinking }),
+      body: JSON.stringify({ text: finalText, model, thinking, fastMode }),
     },
   )
   const thread = normalizeThread(payload.thread)
@@ -346,6 +394,7 @@ export async function startOpenClawThreadTurnStream(
   skills: SkillParam[] = [],
   model = '',
   thinking = '',
+  fastMode = false,
   handlers: {
     onSnapshot?: (payload: { thread: UiThread; messages: UiMessage[] }) => void
     onActivity?: (activity: { label: string; details: string[] }) => void
@@ -355,7 +404,7 @@ export async function startOpenClawThreadTurnStream(
   const response = await fetch(`/codex-api/openclaw/threads/${encodeURIComponent(threadId)}/turns/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: finalText, model, thinking }),
+    body: JSON.stringify({ text: finalText, model, thinking, fastMode }),
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { error?: string }

@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
-import { copyFile, mkdir, readFile, stat } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { appendFile, copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { pathToFileURL } from 'node:url'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { createInterface } from 'node:readline'
+import { tmpdir } from 'node:os'
 import express, { type RequestHandler } from 'express'
 
 const DEFAULT_GATEWAY_URL = 'ws://127.0.0.1:18789'
@@ -37,11 +39,24 @@ type OpenClawModelRow = {
   isDefault: boolean
 }
 
+type OpenClawAgentRow = {
+  id: string
+  name: string
+  isDefault: boolean
+  primaryModel: string
+}
+
 const OPENCLAW_METADATA_CACHE_TTL_MS = 10 * 60 * 1000
 let cachedModels: { rows: OpenClawModelRow[]; atMs: number } | null = null
 let cachedCommands: { rows: OpenClawCommandRow[]; atMs: number } | null = null
 let modelsRefreshPromise: Promise<OpenClawModelRow[]> | null = null
 let commandsRefreshPromise: Promise<OpenClawCommandRow[]> | null = null
+let gatewayCallRuntimePromise: Promise<((opts: Record<string, unknown>) => Promise<Record<string, unknown>>) | null> | null = null
+let gatewayClientClassPromise: Promise<(new (options: Record<string, unknown>) => {
+  start: () => void
+  stop: () => void
+  request: (method: string, params?: Record<string, unknown>, options?: { expectFinal?: boolean; timeoutMs?: number | null }) => Promise<Record<string, unknown>>
+}) | null> | null = null
 
 function readString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
@@ -49,6 +64,14 @@ function readString(value: unknown): string {
 
 function readNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function normalizeOpenClawModelOverride(model: string): string {
+  const normalized = model.trim()
+  if (normalized.toLowerCase().startsWith('openai-codex/gpt-')) {
+    return `codex/${normalized.slice('openai-codex/'.length)}`
+  }
+  return normalized
 }
 
 function encodeThreadId(sessionKey: string): string {
@@ -122,6 +145,9 @@ function runOpenClawStreaming(
   return new Promise((resolve, reject) => {
     const entry = process.env.OPENCLAW_ENTRY || DEFAULT_OPENCLAW_ENTRY
     const command = process.env.OPENCLAW_NODE || process.execPath
+    const startedAtMs = Date.now()
+    let firstStdoutAtMs = 0
+    let firstStderrAtMs = 0
     const child = spawn(command, [entry, ...args], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -135,11 +161,13 @@ function runOpenClawStreaming(
 
     child.stdout.on('data', (chunk) => {
       const text = String(chunk)
+      if (!firstStdoutAtMs) firstStdoutAtMs = Date.now()
       stdout += text
       onOutput(text, 'stdout')
     })
     child.stderr.on('data', (chunk) => {
       const text = String(chunk)
+      if (!firstStderrAtMs) firstStderrAtMs = Date.now()
       stderr += text
       onOutput(text, 'stderr')
     })
@@ -149,6 +177,18 @@ function runOpenClawStreaming(
     })
     child.on('close', (code) => {
       clearTimeout(timer)
+      const completedAtMs = Date.now()
+      const safeArgs = args.map((arg, index) => {
+        const previous = args[index - 1]
+        return previous === '--message' ? `[message:${arg.length} chars]` : arg
+      })
+      console.info('[openclaw-stream]', JSON.stringify({
+        code,
+        durationMs: completedAtMs - startedAtMs,
+        firstStdoutMs: firstStdoutAtMs ? firstStdoutAtMs - startedAtMs : null,
+        firstStderrMs: firstStderrAtMs ? firstStderrAtMs - startedAtMs : null,
+        args: safeArgs,
+      }))
       if (code === 0) {
         resolve(stdout)
         return
@@ -189,6 +229,211 @@ async function gatewayCall(method: string, params: Record<string, unknown> = {},
     '--params',
     JSON.stringify(params),
   ], timeoutMs)
+  return parseJsonObject(output)
+}
+
+async function loadGatewayCallRuntime(): Promise<((opts: Record<string, unknown>) => Promise<Record<string, unknown>>) | null> {
+  if (gatewayCallRuntimePromise) return gatewayCallRuntimePromise
+  gatewayCallRuntimePromise = (async () => {
+    try {
+      const entry = process.env.OPENCLAW_ENTRY || DEFAULT_OPENCLAW_ENTRY
+      const distDir = join(dirname(entry), 'dist')
+      const files = await readdir(distDir)
+      const callFiles = files.filter((name) => /^call-[\w-]+\.js$/u.test(name))
+      for (const callFile of callFiles) {
+        const mod = await import(pathToFileURL(join(distDir, callFile)).href) as {
+          i?: (opts: Record<string, unknown>) => Promise<Record<string, unknown>>
+        }
+        if (typeof mod.i === 'function') return mod.i
+      }
+      return null
+    } catch (error) {
+      console.warn('[openclaw-gateway-runtime] unavailable', error instanceof Error ? error.message : error)
+      return null
+    }
+  })()
+  return gatewayCallRuntimePromise
+}
+
+async function directGatewayCall(method: string, params: Record<string, unknown>, options: {
+  expectFinal?: boolean
+  timeoutMs?: number
+} = {}): Promise<Record<string, unknown>> {
+  const callGateway = await loadGatewayCallRuntime()
+  if (!callGateway) throw new Error('OpenClaw gateway runtime is unavailable')
+  return await callGateway({
+    method,
+    params,
+    expectFinal: options.expectFinal === true,
+    timeoutMs: options.timeoutMs ?? 30_000,
+    clientName: 'gateway-client',
+    clientDisplayName: 'codexclaw',
+    mode: 'backend',
+    scopes: [
+      'operator.admin',
+      'operator.read',
+      'operator.write',
+      'operator.approvals',
+      'operator.pairing',
+      'talk.secrets',
+    ],
+  })
+}
+
+async function getOpenClawGatewayPassword(): Promise<string> {
+  const openClawHome = getOpenClawHome()
+  if (!openClawHome) return ''
+  const config = await readJsonFile(join(openClawHome, 'openclaw.json'))
+  return readString(((config?.gateway as Record<string, unknown> | undefined)?.auth as Record<string, unknown> | undefined)?.password)
+}
+
+async function loadGatewayClientClass(): Promise<(new (options: Record<string, unknown>) => {
+  start: () => void
+  stop: () => void
+  request: (method: string, params?: Record<string, unknown>, options?: { expectFinal?: boolean; timeoutMs?: number | null }) => Promise<Record<string, unknown>>
+}) | null> {
+  if (gatewayClientClassPromise) return gatewayClientClassPromise
+  gatewayClientClassPromise = (async () => {
+    try {
+      const entry = process.env.OPENCLAW_ENTRY || DEFAULT_OPENCLAW_ENTRY
+      const distDir = join(dirname(entry), 'dist')
+      const files = await readdir(distDir)
+      const clientFiles = files.filter((name) => /^client-[\w-]+\.js$/u.test(name))
+      const clientModules: Record<string, unknown>[] = []
+      for (const clientFile of clientFiles) {
+        if (clientFile.includes('bootstrap') || clientFile.includes('info') || clientFile.includes('readiness') || clientFile.includes('factory')) continue
+        try {
+          clientModules.push(await import(pathToFileURL(join(distDir, clientFile)).href) as Record<string, unknown>)
+        } catch {
+          continue
+        }
+      }
+      for (const candidates of [
+        clientModules.map((clientModule) => clientModule.n),
+        clientModules.map((clientModule) => clientModule.GatewayClient),
+      ]) {
+        const GatewayClient = candidates.find((candidate) => {
+          if (typeof candidate !== 'function') return false
+          const prototype = (candidate as { prototype?: Record<string, unknown> }).prototype
+          return Boolean(
+            prototype
+            && typeof prototype.start === 'function'
+            && typeof prototype.stop === 'function'
+            && typeof prototype.request === 'function',
+          )
+        })
+        if (GatewayClient) {
+          return GatewayClient as new (options: Record<string, unknown>) => {
+            start: () => void
+            stop: () => void
+            request: (method: string, params?: Record<string, unknown>, options?: { expectFinal?: boolean; timeoutMs?: number | null }) => Promise<Record<string, unknown>>
+          }
+        }
+      }
+      throw new Error('OpenClaw GatewayClient export missing')
+    } catch (error) {
+      console.warn('[openclaw-gateway-runtime] client unavailable', error instanceof Error ? error.message : error)
+      return null
+    }
+  })()
+  return gatewayClientClassPromise
+}
+
+async function transientGatewayCall(method: string, params: Record<string, unknown>, options: {
+  expectFinal?: boolean
+  timeoutMs?: number | null
+} = {}): Promise<Record<string, unknown>> {
+  const GatewayClient = await loadGatewayClientClass()
+  if (!GatewayClient) throw new Error('OpenClaw gateway client is unavailable')
+  const password = await getOpenClawGatewayPassword()
+  const client = await new Promise<{
+    request: (method: string, params?: Record<string, unknown>, options?: { expectFinal?: boolean; timeoutMs?: number | null }) => Promise<Record<string, unknown>>
+    stop: () => void
+  }>((resolve, reject) => {
+    const gatewayClient = new GatewayClient({
+      url: 'ws://127.0.0.1:18789',
+      password,
+      deviceIdentity: null,
+      clientName: 'gateway-client',
+      clientDisplayName: 'codexclaw-dispatch',
+      mode: 'backend',
+      role: 'operator',
+      scopes: ['operator.admin'],
+      onHelloOk: () => resolve(gatewayClient),
+      onConnectError: (error: unknown) => reject(error instanceof Error ? error : new Error(String(error))),
+    })
+    gatewayClient.start()
+  })
+  try {
+    return await client.request(method, params, {
+      expectFinal: options.expectFinal === true,
+      timeoutMs: options.timeoutMs ?? 30_000,
+    })
+  } finally {
+    client.stop()
+  }
+}
+
+async function runOpenClawGatewayAgent(params: Record<string, unknown>, timeoutMs = 30_000): Promise<Record<string, unknown>> {
+  const entry = process.env.OPENCLAW_ENTRY || DEFAULT_OPENCLAW_ENTRY
+  const script = `
+    import { pathToFileURL } from 'node:url';
+    import { dirname, join } from 'node:path';
+    import { readdir } from 'node:fs/promises';
+    const params = JSON.parse(process.argv[1]);
+    const distDir = join(dirname(${JSON.stringify(entry)}), 'dist');
+    const callFiles = (await readdir(distDir)).filter((name) => /^call-[\\w-]+\\.js$/u.test(name));
+    let callGateway = null;
+    for (const callFile of callFiles) {
+      const mod = await import(pathToFileURL(join(distDir, callFile)).href);
+      if (typeof mod.i === 'function') {
+        callGateway = mod.i;
+        break;
+      }
+    }
+    if (typeof callGateway !== 'function') throw new Error('OpenClaw call runtime export missing');
+    const result = await callGateway({
+      method: 'agent',
+      params,
+      expectFinal: false,
+      timeoutMs: ${timeoutMs},
+      clientName: 'gateway-client',
+      clientDisplayName: 'codexclaw-helper',
+      mode: 'backend',
+      scopes: ['operator.admin','operator.read','operator.write','operator.approvals','operator.pairing','talk.secrets'],
+    });
+    console.log(JSON.stringify(result ?? {}));
+  `
+  const output = await new Promise<string>((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(params)], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`OpenClaw gateway helper timed out after ${timeoutMs}ms`))
+    }, timeoutMs + 5_000)
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString()
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0) {
+        resolve(stdout)
+        return
+      }
+      reject(new Error((stderr || stdout || `OpenClaw gateway helper exited with code ${code}`).trim()))
+    })
+  })
   return parseJsonObject(output)
 }
 
@@ -260,7 +505,7 @@ async function stageAttachment(sourcePath: string, label: string, workspace: str
 async function readJsonFile(path: string): Promise<Record<string, unknown> | null> {
   try {
     const raw = await readFile(path, 'utf8')
-    const parsed = JSON.parse(raw) as unknown
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/u, '')) as unknown
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : null
@@ -303,6 +548,40 @@ function readConfiguredAgentIds(config: Record<string, unknown> | null): Set<str
   return configuredAgentIds
 }
 
+async function listConfiguredAgents(): Promise<OpenClawAgentRow[]> {
+  const openClawHome = getOpenClawHome()
+  const config = openClawHome ? await readJsonFile(join(openClawHome, 'openclaw.json')) : null
+  const agents = config?.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)
+    ? config.agents as Record<string, unknown>
+    : {}
+  const agentList = Array.isArray(agents.list) ? agents.list : []
+  const rows = agentList.flatMap((entry): OpenClawAgentRow[] => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+    const row = entry as Record<string, unknown>
+    const id = readString(row.id)
+    if (!id) return []
+    return [{
+      id,
+      name: readString(row.name) || id,
+      isDefault: row.default === true,
+      primaryModel: readString((row.model as Record<string, unknown> | undefined)?.primary),
+    }]
+  })
+  return rows.sort((first, second) => {
+    if (first.isDefault !== second.isDefault) return first.isDefault ? -1 : 1
+    return first.name.localeCompare(second.name)
+  })
+}
+
+async function resolveConfiguredAgentId(rawAgentId: unknown): Promise<string> {
+  const agents = await listConfiguredAgents()
+  const requested = readString(rawAgentId)
+  if (requested && agents.some((agent) => agent.id === requested)) return requested
+  const envDefault = readString(process.env.OPENCLAW_DEFAULT_AGENT)
+  if (envDefault && agents.some((agent) => agent.id === envDefault)) return envDefault
+  return agents.find((agent) => agent.isDefault)?.id || agents[0]?.id || envDefault || 'ari-super'
+}
+
 async function listLocalSessions(limit = 100): Promise<OpenClawSessionRow[]> {
   const openClawHome = getOpenClawHome()
   if (!openClawHome) return []
@@ -337,9 +616,53 @@ async function listSessions(limit = 100): Promise<OpenClawSessionRow[]> {
   )
 }
 
+async function findLocalSession(sessionKey: string): Promise<OpenClawSessionRow | null> {
+  const agentId = agentIdFromSessionKey(sessionKey)
+  const openClawHome = getOpenClawHome()
+  if (!agentId || !openClawHome) return null
+  const storePath = join(openClawHome, 'agents', agentId, 'sessions', 'sessions.json')
+  const store = await readJsonFile(storePath)
+  const entry = store?.[sessionKey]
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  return {
+    ...(entry as OpenClawSessionRow),
+    key: sessionKey,
+    agentId,
+  }
+}
+
 async function findSession(sessionKey: string): Promise<OpenClawSessionRow | null> {
+  const localSession = await findLocalSession(sessionKey)
+  if (localSession) return localSession
   const sessions = await listSessions(250)
   return sessions.find((session) => readString(session.key) === sessionKey) ?? null
+}
+
+async function renameLocalSession(sessionKey: string, displayName: string): Promise<OpenClawSessionRow> {
+  const agentId = agentIdFromSessionKey(sessionKey)
+  if (!agentId) throw new Error('OpenClaw session does not include an agent id')
+  const openClawHome = getOpenClawHome()
+  if (!openClawHome) throw new Error('OpenClaw home is not configured')
+  const storePath = join(openClawHome, 'agents', agentId, 'sessions', 'sessions.json')
+  const store = await readJsonFile(storePath)
+  const existing = store?.[sessionKey]
+  if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+    throw new Error('OpenClaw session not found')
+  }
+  const nextEntry = {
+    ...(existing as OpenClawSessionRow),
+    displayName,
+  }
+  const nextStore = {
+    ...store,
+    [sessionKey]: nextEntry,
+  }
+  await writeFile(storePath, `${JSON.stringify(nextStore, null, 2)}\n`, 'utf8')
+  return {
+    ...nextEntry,
+    key: sessionKey,
+    agentId,
+  }
 }
 
 async function enrichSession(session: OpenClawSessionRow): Promise<OpenClawSessionRow> {
@@ -489,6 +812,62 @@ async function readSessionMessages(sessionFile: string): Promise<Record<string, 
   return rows
 }
 
+function countAssistantMessages(messages: Record<string, unknown>[]): number {
+  return messages.filter((message) => readString(message.role) === 'assistant').length
+}
+
+function hasAssistantMessageSince(messages: Record<string, unknown>[], sinceMs: number): boolean {
+  return messages.some((message) => {
+    if (readString(message.role) !== 'assistant') return false
+    const timestampMs = Date.parse(readString(message.timestamp))
+    return Number.isFinite(timestampMs) && timestampMs >= sinceMs
+  })
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForAssistantReply(
+  sessionKey: string,
+  baselineAssistantCount: number,
+  timeoutMs: number,
+  knownSessionFile = '',
+  turnStartedAtMs = Date.now(),
+): Promise<void> {
+  const startedAtMs = Date.now()
+  while (Date.now() - startedAtMs < timeoutMs) {
+    const currentSessionFile = readString((await findLocalSession(sessionKey))?.sessionFile)
+    const sessionFiles = Array.from(new Set([knownSessionFile, currentSessionFile].filter(Boolean)))
+    for (const sessionFile of sessionFiles) {
+      const messages = await readSessionMessages(sessionFile)
+      if (sessionFile === knownSessionFile && countAssistantMessages(messages) > baselineAssistantCount) return
+      if (hasAssistantMessageSince(messages, turnStartedAtMs - 5_000)) return
+    }
+    await sleep(250)
+  }
+  throw new Error(`OpenClaw turn timed out after ${timeoutMs}ms`)
+}
+
+async function waitForCompletedSessionSnapshot(
+  sessionKey: string,
+  fallbackSession: OpenClawSessionRow,
+  timeoutMs: number,
+): Promise<{ session: OpenClawSessionRow; messages: Record<string, unknown>[] }> {
+  const startedAtMs = Date.now()
+  let latestSession = await findSession(sessionKey) ?? fallbackSession
+  let latestMessages = await readSessionMessages(readString(latestSession.sessionFile))
+  while (Date.now() - startedAtMs < timeoutMs) {
+    latestSession = await findSession(sessionKey) ?? latestSession
+    latestMessages = await readSessionMessages(readString(latestSession.sessionFile))
+    if (latestSession.hasActiveRun !== true && readString(latestSession.status) !== 'running') {
+      return { session: latestSession, messages: latestMessages }
+    }
+    await sleep(250)
+  }
+  return { session: latestSession, messages: latestMessages }
+}
+
 function toThread(session: OpenClawSessionRow): Record<string, unknown> {
   const key = readString(session.key)
   const title = readString(session.displayName) || readString(session.label) || key.split(':').slice(-1)[0] || 'OpenClaw session'
@@ -507,63 +886,259 @@ function toThread(session: OpenClawSessionRow): Record<string, unknown> {
   }
 }
 
-async function sendToSession(session: OpenClawSessionRow, text: string, options: { model?: string; thinking?: string } = {}): Promise<void> {
-  const sessionId = readString(session.sessionId)
-  const sessionKey = readString(session.key)
-  const agentId = agentIdFromSessionKey(sessionKey)
-  if (!sessionId) throw new Error('OpenClaw session is missing sessionId')
-  const args = ['agent', '--json', '--session-id', sessionId, '--message', text]
-  if (agentId) args.splice(1, 0, '--agent', agentId)
-  await runOpenClaw(appendRunOptions(args, options), 900_000)
+function toCompletedThread(session: OpenClawSessionRow): Record<string, unknown> {
+  return {
+    ...toThread(session),
+    inProgress: false,
+  }
 }
 
-function appendRunOptions(args: string[], options: { model?: string; thinking?: string } = {}): string[] {
-  const model = readString(options.model)
+function appendRunOptions(args: string[], options: { model?: string; thinking?: string; fastMode?: boolean } = {}): string[] {
+  const model = normalizeOpenClawModelOverride(readString(options.model))
   const thinking = readString(options.thinking)
-  if (model && process.env.OPENCLAW_ALLOW_MODEL_OVERRIDE === '1') args.push('--model', model)
+  if (model && isPermittedOpenClawModelOverride(model)) args.push('--model', model)
   if (thinking) args.push('--thinking', thinking)
   return args
 }
 
-function buildSendArgs(session: OpenClawSessionRow, text: string, options: { model?: string; thinking?: string } = {}): string[] {
+function buildSendArgs(session: OpenClawSessionRow, text: string, options: { model?: string; thinking?: string; fastMode?: boolean } = {}): string[] {
   const sessionId = readString(session.sessionId)
   const sessionKey = readString(session.key)
   const agentId = agentIdFromSessionKey(sessionKey)
   if (!sessionId) throw new Error('OpenClaw session is missing sessionId')
+  if (!agentId) throw new Error('OpenClaw session is missing agent id')
   const args = ['agent', '--json', '--session-id', sessionId, '--message', text]
-  if (agentId) args.splice(1, 0, '--agent', agentId)
+  args.splice(1, 0, '--agent', agentId)
   return appendRunOptions(args, options)
+}
+
+function normalizeCodexExecModel(model: string): string {
+  const normalized = normalizeOpenClawModelOverride(model)
+  if (normalized.startsWith('codex/')) return normalized.slice('codex/'.length)
+  if (normalized.startsWith('openai/')) return normalized.slice('openai/'.length)
+  return normalized || 'gpt-5.4-mini'
+}
+
+function runCodexExecFastReply(
+  session: OpenClawSessionRow,
+  text: string,
+  options: { model?: string; thinking?: string; fastMode?: boolean } = {},
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const outputPath = join(tmpdir(), `codexclaw-fast-${randomUUID()}.txt`)
+    const model = normalizeCodexExecModel(readString(options.model))
+    const workspaceDir = readString(session.workspaceDir) || readString(session.cwd) || join(getOpenClawHome(), 'workspace-family-finance')
+    const codexCmd = process.platform === 'win32'
+      ? join(process.env.APPDATA || '', 'npm', 'codex.cmd')
+      : 'codex'
+    const args = [
+      'exec',
+      '--ephemeral',
+      '--skip-git-repo-check',
+      '--cd',
+      workspaceDir,
+      '--model',
+      model,
+      '--output-last-message',
+      outputPath,
+      text,
+    ]
+    const startedAtMs = Date.now()
+    const child = process.platform === 'win32'
+      ? spawn('cmd.exe', ['/d', '/s', '/c', codexCmd, ...args], {
+        windowsHide: true,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      : spawn(codexCmd, args, {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error('Codex fast mode timed out'))
+    }, 120_000)
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', async (code) => {
+      clearTimeout(timer)
+      try {
+        const reply = existsSync(outputPath) ? (await readFile(outputPath, 'utf8')).trim() : ''
+        await unlink(outputPath).catch(() => {})
+        console.info('[openclaw-fast-codex]', JSON.stringify({
+          code,
+          durationMs: Date.now() - startedAtMs,
+          model,
+        }))
+        if (code !== 0) throw new Error((stderr || `codex exited with code ${code}`).trim())
+        resolve(reply || 'OK')
+      } catch (error) {
+        reject(error)
+      }
+    })
+  })
+}
+
+async function persistFastReplyToSession(session: OpenClawSessionRow, text: string, reply: string): Promise<void> {
+  const sessionKey = readString(session.key)
+  const agentId = agentIdFromSessionKey(sessionKey)
+  const openClawHome = getOpenClawHome()
+  if (!sessionKey || !agentId || !openClawHome) return
+  const storePath = join(openClawHome, 'agents', agentId, 'sessions', 'sessions.json')
+  const store = await readJsonFile(storePath) ?? {}
+  const now = Date.now()
+  const entry = store[sessionKey] && typeof store[sessionKey] === 'object' && !Array.isArray(store[sessionKey])
+    ? store[sessionKey] as OpenClawSessionRow
+    : session
+  const sessionId = readString(entry.sessionId) || readString(session.sessionId) || randomUUID()
+  const sessionFile = readString(entry.sessionFile) || readString(session.sessionFile) || join(openClawHome, 'agents', agentId, 'sessions', `${sessionId}.jsonl`)
+  await mkdir(dirname(sessionFile), { recursive: true })
+  const userId = randomUUID()
+  const assistantId = randomUUID()
+  const timestamp = new Date(now).toISOString()
+  const rows = [
+    {
+      type: 'message',
+      id: userId,
+      parentId: null,
+      timestamp,
+      message: {
+        role: 'user',
+        content: text,
+        timestamp: now,
+      },
+    },
+    {
+      type: 'message',
+      id: assistantId,
+      parentId: userId,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: reply }],
+        provider: 'codex',
+        model: 'fast-codex-exec',
+        stopReason: 'stop',
+        timestamp: now,
+      },
+    },
+  ]
+  await appendFile(sessionFile, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8')
+  const nextStore = {
+    ...store,
+    [sessionKey]: {
+      ...entry,
+      sessionId,
+      sessionFile,
+      updatedAt: now,
+      status: 'done',
+      fastMode: true,
+    },
+  }
+  await writeFile(storePath, `${JSON.stringify(nextStore, null, 2)}\n`, 'utf8')
 }
 
 async function sendToSessionStreaming(
   session: OpenClawSessionRow,
   text: string,
   onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
-  options: { model?: string; thinking?: string } = {},
+  options: { model?: string; thinking?: string; fastMode?: boolean } = {},
 ): Promise<void> {
+  const sessionId = readString(session.sessionId)
+  const sessionKey = readString(session.key)
+  const agentId = agentIdFromSessionKey(sessionKey)
+  if (!sessionId) throw new Error('OpenClaw session is missing sessionId')
+  if (!sessionKey) throw new Error('OpenClaw session is missing session key')
+  if (!agentId) throw new Error('OpenClaw session is missing agent id')
+  const beforeMessages = await readSessionMessages(readString(session.sessionFile))
+  const baselineAssistantCount = countAssistantMessages(beforeMessages)
+  const model = normalizeOpenClawModelOverride(readString(options.model))
+  const thinking = readString(options.thinking)
+  const fastMode = options.fastMode === true
+  const runId = randomUUID()
+  const turnStartedAtMs = Date.now()
+  if (fastMode) {
+    const reply = await runCodexExecFastReply(session, text, options)
+    await persistFastReplyToSession(session, text, reply)
+    onOutput('Codex fast mode reply received', 'stdout')
+    return
+  }
+  try {
+    const gatewayParams = {
+      agentId,
+      sessionId,
+      sessionKey,
+      idempotencyKey: runId,
+      message: text,
+      deliver: false,
+      channel: 'webchat',
+      ...(fastMode ? {
+        modelRun: true,
+        promptMode: 'none',
+        bootstrapContextMode: 'lightweight',
+        cleanupBundleMcpOnRunEnd: true,
+      } : {}),
+      ...(model && isPermittedOpenClawModelOverride(model) ? parseModelOverride(model) : {}),
+      ...(thinking ? { thinking } : {}),
+    }
+    await transientGatewayCall('agent', gatewayParams, { expectFinal: false, timeoutMs: 5_000 })
+    onOutput('OpenClaw accepted the turn', 'stdout')
+    await waitForAssistantReply(sessionKey, baselineAssistantCount, 900_000, readString(session.sessionFile), turnStartedAtMs)
+    onOutput('OpenClaw reply received', 'stdout')
+    return
+  } catch (error) {
+    onOutput(`Gateway path failed, falling back to OpenClaw CLI: ${error instanceof Error ? error.message : 'unknown error'}`, 'stderr')
+  }
   await runOpenClawStreaming(buildSendArgs(session, text, options), onOutput, 900_000)
 }
 
-async function startSession(text: string, options: { model?: string; thinking?: string } = {}): Promise<OpenClawSessionRow> {
+async function startSession(
+  text: string,
+  options: { model?: string; thinking?: string; fastMode?: boolean } = {},
+  rawAgentId: unknown = '',
+): Promise<OpenClawSessionRow> {
   const sessionId = randomUUID()
-  await runOpenClaw(appendRunOptions([
-    'agent',
-    '--json',
-    '--agent',
-    process.env.OPENCLAW_DEFAULT_AGENT || 'ari-super',
-    '--session-id',
-    sessionId,
-    '--message',
-    text,
-  ], options), 900_000)
-  const sessions = await listSessions(250)
-  return sessions.find((session) => readString(session.sessionId) === sessionId)
-    ?? {
-      key: `agent:${process.env.OPENCLAW_DEFAULT_AGENT || 'ari-super'}:${sessionId}`,
-      sessionId,
-      displayName: text.slice(0, 80),
-      updatedAt: Date.now(),
-    }
+  const agentId = await resolveConfiguredAgentId(rawAgentId)
+  const sessionKey = `agent:${agentId}:explicit:${sessionId}`
+  const model = normalizeOpenClawModelOverride(readString(options.model))
+  const thinking = readString(options.thinking)
+  const createResult = await directGatewayCall('sessions.create', {
+    agentId,
+    key: sessionKey,
+    ...(model && isPermittedOpenClawModelOverride(model) ? { model } : {}),
+  }, { expectFinal: false, timeoutMs: 30_000 })
+  const resolvedSessionKey = readString(createResult.key) || sessionKey
+  let patchedEntry: Record<string, unknown> | null = null
+  if (options.fastMode === true || thinking) {
+    const patchResult = await directGatewayCall('sessions.patch', {
+      key: resolvedSessionKey,
+      ...(options.fastMode === true ? { fastMode: true } : {}),
+      ...(thinking ? { thinkingLevel: thinking } : {}),
+    }, { expectFinal: false, timeoutMs: 30_000 })
+    patchedEntry = patchResult.entry && typeof patchResult.entry === 'object'
+      ? patchResult.entry as Record<string, unknown>
+      : null
+  }
+  const createdEntry = createResult.entry && typeof createResult.entry === 'object'
+    ? createResult.entry as Record<string, unknown>
+    : null
+  const session = {
+    ...(createdEntry ?? {}),
+    ...(patchedEntry ?? {}),
+    key: resolvedSessionKey,
+    sessionId: readString(patchedEntry?.sessionId) || readString(createdEntry?.sessionId) || sessionId,
+    displayName: readString(patchedEntry?.displayName) || readString(createdEntry?.displayName) || text.slice(0, 80),
+    updatedAt: patchedEntry?.updatedAt ?? createdEntry?.updatedAt ?? Date.now(),
+    ...(options.fastMode === true ? { fastMode: true } : {}),
+    ...(thinking ? { thinkingLevel: thinking } : {}),
+  }
+  await sendToSessionStreaming(session, text, () => {}, options)
+  return await findSession(resolvedSessionKey) ?? session
 }
 
 function asyncHandler(handler: RequestHandler): RequestHandler {
@@ -577,20 +1152,39 @@ function writeSse(res: express.Response, event: string, data: unknown): void {
   res.write(`data: ${JSON.stringify(data)}\n\n`)
 }
 
-function readOpenClawRunOptions(body: unknown): { model?: string; thinking?: string } {
+function readOpenClawRunOptions(body: unknown): { model?: string; thinking?: string; fastMode?: boolean } {
   const row = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {}
   const model = readString(row.model)
   const thinking = readString(row.thinking)
+  const fastMode = row.fastMode !== false
   return {
     ...(model ? { model } : {}),
     ...(thinking ? { thinking } : {}),
+    ...(fastMode ? { fastMode } : {}),
   }
 }
 
 function normalizeThinking(value: string): string {
   return value === 'none' ? 'off' : value
+}
+
+function isPermittedOpenClawModelOverride(model: string): boolean {
+  const normalized = normalizeOpenClawModelOverride(model).toLowerCase()
+  return normalized.startsWith('openai/')
+    || normalized.startsWith('openai-codex/')
+    || normalized.startsWith('codex/')
+}
+
+function parseModelOverride(model: string): Record<string, string> {
+  const normalized = normalizeOpenClawModelOverride(model)
+  const slashIndex = normalized.indexOf('/')
+  if (slashIndex <= 0 || slashIndex >= normalized.length - 1) return { model: normalized }
+  return {
+    provider: normalized.slice(0, slashIndex),
+    model: normalized.slice(slashIndex + 1),
+  }
 }
 
 function isFreshMetadataCache(atMs: number): boolean {
@@ -720,7 +1314,7 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
       return
     }
 
-    let agentId = process.env.OPENCLAW_DEFAULT_AGENT || 'ari-super'
+    let agentId = await resolveConfiguredAgentId(req.body?.agentId)
     if (rawThreadId) {
       const sessionKey = decodeThreadId(rawThreadId)
       agentId = agentIdFromSessionKey(sessionKey) || agentId
@@ -754,6 +1348,10 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
     res.json({ models: await listConfiguredModels() })
   }))
 
+  router.get('/agents', asyncHandler(async (_req, res) => {
+    res.json({ agents: await listConfiguredAgents() })
+  }))
+
   router.get('/commands', asyncHandler(async (_req, res) => {
     res.json({ commands: await listVisibleCommands() })
   }))
@@ -775,6 +1373,17 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
     })
   }))
 
+  router.patch('/threads/:threadId', asyncHandler(async (req, res) => {
+    const sessionKey = decodeThreadId(readRouteParam(req.params.threadId))
+    const displayName = readString(req.body?.name ?? req.body?.displayName)
+    if (!displayName) {
+      res.status(400).json({ error: 'name is required' })
+      return
+    }
+    const session = await renameLocalSession(sessionKey, displayName)
+    res.json({ thread: toThread(session) })
+  }))
+
   router.post('/threads', asyncHandler(async (req, res) => {
     const text = readString(req.body?.text)
     if (!text) {
@@ -783,7 +1392,7 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
     }
     const options = readOpenClawRunOptions(req.body)
     if (options.thinking) options.thinking = normalizeThinking(options.thinking)
-    const session = await startSession(text, options)
+    const session = await startSession(text, options, req.body?.agentId)
     res.json({ thread: toThread(session), messages: await readSessionMessages(readString(session.sessionFile)) })
   }))
 
@@ -801,9 +1410,9 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
     }
     const options = readOpenClawRunOptions(req.body)
     if (options.thinking) options.thinking = normalizeThinking(options.thinking)
-    await sendToSession(session, text, options)
-    const refreshed = await findSession(sessionKey) ?? session
-    res.json({ thread: toThread(refreshed), messages: await readSessionMessages(readString(refreshed.sessionFile)) })
+    await sendToSessionStreaming(session, text, () => {}, options)
+    const { session: refreshed, messages } = await waitForCompletedSessionSnapshot(sessionKey, session, 5_000)
+    res.json({ thread: toCompletedThread(refreshed), messages })
   }))
 
   router.post('/threads/:threadId/turns/stream', asyncHandler(async (req, res) => {
@@ -831,13 +1440,24 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
     })
 
     let lastSnapshot = ''
+    const turnStartedAtMs = Date.now()
+    let firstActivityAtMs = 0
+    let firstSnapshotAtMs = 0
     const sendSnapshot = async (event: 'snapshot' | 'done' = 'snapshot') => {
-      const refreshed = await findSession(sessionKey) ?? session
-      const messages = await readSessionMessages(readString(refreshed.sessionFile))
-      const payload = { thread: toThread(refreshed), messages }
+      const { session: refreshed, messages } = event === 'done'
+        ? await waitForCompletedSessionSnapshot(sessionKey, session, 5_000)
+        : { session: await findSession(sessionKey) ?? session, messages: [] as Record<string, unknown>[] }
+      const resolvedMessages = event === 'done'
+        ? messages
+        : await readSessionMessages(readString(refreshed.sessionFile))
+      const payload = {
+        thread: event === 'done' ? toCompletedThread(refreshed) : toThread(refreshed),
+        messages: resolvedMessages,
+      }
       const serialized = JSON.stringify(payload)
       if (event !== 'done' && serialized === lastSnapshot) return
       lastSnapshot = serialized
+      if (!firstSnapshotAtMs) firstSnapshotAtMs = Date.now()
       writeSse(res, event, payload)
     }
 
@@ -859,6 +1479,7 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
       if (options.thinking) options.thinking = normalizeThinking(options.thinking)
       await sendToSessionStreaming(session, text, (chunk, stream) => {
         if (closed) return
+        if (!firstActivityAtMs) firstActivityAtMs = Date.now()
         const detail = chunk.trim().slice(0, 500)
         if (!detail) return
         writeSse(res, 'activity', {
@@ -868,6 +1489,15 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
       }, options)
       clearInterval(interval)
       await sendSnapshot('done')
+      console.info('[openclaw-turn]', JSON.stringify({
+        sessionKey,
+        model: readString(options.model),
+        thinking: readString(options.thinking),
+        fastMode: options.fastMode === true,
+        durationMs: Date.now() - turnStartedAtMs,
+        firstActivityMs: firstActivityAtMs ? firstActivityAtMs - turnStartedAtMs : null,
+        firstSnapshotMs: firstSnapshotAtMs ? firstSnapshotAtMs - turnStartedAtMs : null,
+      }))
     } catch (error) {
       clearInterval(interval)
       writeSse(res, 'error', { error: error instanceof Error ? error.message : 'OpenClaw request failed' })

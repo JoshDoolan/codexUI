@@ -258,13 +258,24 @@
 
         <template v-if="!isDictationRecording">
           <ComposerDropdown
+            v-if="agentOptions.length > 0"
+            class="thread-composer-control"
+            :model-value="selectedAgentId ?? ''"
+            :options="agentOptions"
+            :placeholder="t('Agent')"
+            open-direction="up"
+            :disabled="isComposerConfigDisabled || agentSelectorDisabled"
+            @update:model-value="onAgentSelect"
+          />
+
+          <ComposerDropdown
             class="thread-composer-control"
             :model-value="selectedModel"
             :options="modelOptions"
             :selected-prefix-icon="showFastModeModelIcon ? IconTablerBolt : null"
             :placeholder="t('Model')"
             open-direction="up"
-            :disabled="isComposerConfigDisabled || models.length === 0"
+            :disabled="isComposerConfigDisabled || modelSelectorDisabled || models.length === 0"
             enable-search
             :search-placeholder="t('Search models...')"
             @update:model-value="onModelSelect"
@@ -430,14 +441,19 @@ type SkillSourceBadge = {
 
 type SkillItem = { name: string; displayName?: string; description: string; path: string; scope?: string; enabled?: boolean }
 type SlashCommandItem = { name: string; description?: string; source?: string }
+type ComposerOption = { value: string; label: string }
 
 const props = defineProps<{
   activeThreadId: string
   cwd?: string
   collaborationModes?: CollaborationModeOption[]
   selectedCollaborationMode: CollaborationModeKind
+  agentOptions?: ComposerOption[]
+  selectedAgentId?: string
+  agentSelectorDisabled?: boolean
   models: string[]
   selectedModel: string
+  modelSelectorDisabled?: boolean
   selectedReasoningEffort: ReasoningEffort | ''
   selectedSpeedMode: SpeedMode
   forceFastModeAvailable?: boolean
@@ -486,6 +502,7 @@ const emit = defineEmits<{
   submit: [payload: SubmitPayload]
   interrupt: []
   'update:selected-collaboration-mode': [mode: CollaborationModeKind]
+  'update:selected-agent-id': [agentId: string]
   'update:selected-model': [modelId: string]
   'update:selected-reasoning-effort': [effort: ReasoningEffort | '']
   'update:selected-speed-mode': [mode: SpeedMode]
@@ -603,6 +620,7 @@ function formatModelLabel(modelId: string): string {
 const modelOptions = computed(() =>
   props.models.map((modelId) => ({ value: modelId, label: formatModelLabel(modelId) })),
 )
+const agentOptions = computed(() => props.agentOptions ?? [])
 const isPlanModeSelected = computed(() => props.selectedCollaborationMode === 'plan')
 
 const isPlanModeWaitingForModel = computed(() =>
@@ -1116,6 +1134,10 @@ function onInterrupt(): void {
 
 function onModelSelect(value: string): void {
   emit('update:selected-model', value)
+}
+
+function onAgentSelect(value: string): void {
+  emit('update:selected-agent-id', value)
 }
 
 function toggleCollaborationMode(): void {

@@ -917,6 +917,10 @@
                   :collaboration-modes="availableCollaborationModes"
                   :selected-collaboration-mode="selectedCollaborationMode"
                   :models="composerModelIds" :selected-model="composerSelectedModelId"
+                  :agent-options="selectedSessionSource === 'openclaw' ? openClawAgentOptions : []"
+                  :selected-agent-id="composerSelectedOpenClawAgentId"
+                  :agent-selector-disabled="isExistingOpenClawThread"
+                  :model-selector-disabled="selectedSessionSource === 'openclaw' && isExistingOpenClawThread"
                   :selected-reasoning-effort="selectedReasoningEffort"
                   :selected-speed-mode="selectedSpeedMode"
                   :force-fast-mode-available="selectedSessionSource === 'openclaw'"
@@ -933,6 +937,7 @@
                   :dictation-language="dictationLanguage"
                   @submit="onSubmitThreadMessage"
                   @update:selected-collaboration-mode="onSelectCollaborationMode"
+                  @update:selected-agent-id="onSelectOpenClawAgent"
                   @update:selected-model="onSelectModel"
                   @update:selected-reasoning-effort="onSelectReasoningEffort"
                   @update:selected-speed-mode="onSelectSpeedMode" />
@@ -997,6 +1002,10 @@
                     :selected-collaboration-mode="selectedCollaborationMode"
                     :models="composerModelIds"
                     :selected-model="composerSelectedModelId"
+                    :agent-options="selectedSessionSource === 'openclaw' ? openClawAgentOptions : []"
+                    :selected-agent-id="composerSelectedOpenClawAgentId"
+                    :agent-selector-disabled="isExistingOpenClawThread"
+                    :model-selector-disabled="selectedSessionSource === 'openclaw' && isExistingOpenClawThread"
                     :selected-reasoning-effort="selectedReasoningEffort"
                     :selected-speed-mode="selectedSpeedMode"
                     :force-fast-mode-available="selectedSessionSource === 'openclaw'"
@@ -1014,6 +1023,7 @@
                     :dictation-click-to-toggle="dictationClickToToggle" :dictation-auto-send="dictationAutoSend"
                     :dictation-language="dictationLanguage"
                     @update:selected-collaboration-mode="onSelectCollaborationMode"
+                    @update:selected-agent-id="onSelectOpenClawAgent"
                     @submit="onSubmitThreadMessage" @update:selected-model="onSelectModel"
                     @update:selected-reasoning-effort="onSelectReasoningEffort"
                     @update:selected-speed-mode="onSelectSpeedMode"
@@ -1342,6 +1352,8 @@ const {
   selectedThreadId,
   availableCollaborationModes,
   availableModelIds,
+  openClawAgents,
+  selectedOpenClawAgentId,
   openClawModelIds,
   openClawCommands,
   selectedCollaborationMode,
@@ -1362,6 +1374,7 @@ const {
   isUpdatingSpeedMode,
   refreshAll,
   setSelectedSessionSource,
+  setSelectedOpenClawAgentId,
   refreshSkills,
   selectThread,
   ensureThreadMessagesLoaded,
@@ -1618,7 +1631,7 @@ const liveOverlay = computed(() => selectedLiveOverlay.value)
 const composerThreadContextId = computed(() => (isHomeRoute.value ? '__new-thread__' : selectedThreadId.value))
 const openClawFastModeDescription = computed(() => (
   selectedSpeedMode.value === 'fast'
-    ? t('Uses minimal OpenClaw thinking for quicker replies')
+    ? t('Uses minimal OpenClaw thinking. The OpenClaw CLI does not expose Codex priority tier here yet.')
     : t('Uses the selected OpenClaw thinking level')
 ))
 const composerModelIds = computed(() => (
@@ -1626,13 +1639,61 @@ const composerModelIds = computed(() => (
     ? openClawModelIds.value
     : availableModelIds.value
 ))
+function normalizeOpenClawThreadModel(rawModel: string, agentId: string): string {
+  const model = rawModel.trim()
+  if (!model) return ''
+  const availableModels = composerModelIds.value
+  if (availableModels.includes(model)) return model
+  const agentPrimaryModel = openClawAgents.value.find((agent) => agent.id === agentId)?.primaryModel?.trim() ?? ''
+  if (agentPrimaryModel && (
+    agentPrimaryModel === model
+    || agentPrimaryModel.endsWith(`/${model}`)
+    || model.endsWith(`/${agentPrimaryModel}`)
+  )) {
+    return availableModels.includes(agentPrimaryModel) ? agentPrimaryModel : agentPrimaryModel
+  }
+  const openAiModel = `openai/${model}`
+  if (availableModels.includes(openAiModel)) return openAiModel
+  const openAiCodexModel = `openai-codex/${model}`
+  if (availableModels.includes(openAiCodexModel)) return openAiCodexModel
+  const codexModel = `codex/${model}`
+  if (availableModels.includes(codexModel)) return codexModel
+  return model
+}
 const composerSelectedModelId = computed(() => {
   const selectedModel = readModelIdForThread(composerThreadContextId.value)
   if (selectedSessionSource.value !== 'openclaw') return selectedModel
+  if (isExistingOpenClawThread.value) {
+    const threadModel = normalizeOpenClawThreadModel(
+      selectedThread.value?.preview ?? '',
+      selectedThreadOpenClawAgentId.value,
+    )
+    if (threadModel) return threadModel
+  }
   return composerModelIds.value.includes(selectedModel)
     ? selectedModel
     : composerModelIds.value[0] ?? selectedModel
 })
+const openClawAgentOptions = computed(() =>
+  openClawAgents.value.map((agent) => ({ value: agent.id, label: agent.name || agent.id })),
+)
+function openClawAgentIdFromThreadId(threadId: string): string {
+  if (!threadId.startsWith('openclaw::')) return ''
+  try {
+    const sessionKey = decodeURIComponent(threadId.slice('openclaw::'.length))
+    const match = /^agent:([^:]+):/.exec(sessionKey)
+    return match?.[1] ?? ''
+  } catch {
+    return ''
+  }
+}
+const selectedThreadOpenClawAgentId = computed(() => openClawAgentIdFromThreadId(selectedThreadId.value))
+const isExistingOpenClawThread = computed(() => selectedThreadOpenClawAgentId.value.length > 0 && !isHomeRoute.value)
+const composerSelectedOpenClawAgentId = computed(() =>
+  isExistingOpenClawThread.value
+    ? selectedThreadOpenClawAgentId.value
+    : selectedOpenClawAgentId.value,
+)
 const selectedThreadPendingRequest = computed<UiServerRequest | null>(() => {
   const rows = selectedThreadServerRequests.value
   return rows.length > 0 ? rows[rows.length - 1] : null
@@ -3686,7 +3747,13 @@ function onReorderQueuedMessage(payload: { draggedId: string; targetId: string }
 }
 
 function onSelectModel(modelId: string): void {
+  if (selectedSessionSource.value === 'openclaw' && isExistingOpenClawThread.value) return
   setSelectedModelIdForThread(composerThreadContextId.value, modelId)
+}
+
+function onSelectOpenClawAgent(agentId: string): void {
+  if (isExistingOpenClawThread.value) return
+  setSelectedOpenClawAgentId(agentId)
 }
 
 function onSelectReasoningEffort(effort: ReasoningEffort | ''): void {
