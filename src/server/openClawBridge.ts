@@ -1014,18 +1014,29 @@ function summarizeCodexExecJsonLine(line: string): { label: string; details: str
   }
 }
 
-function runCodexExecFastReply(
+async function resolveSessionWorkspace(session: OpenClawSessionRow): Promise<string> {
+  const explicitWorkspace = readString(session.workspaceDir) || readString(session.cwd)
+  if (explicitWorkspace) return explicitWorkspace
+
+  const agentId = agentIdFromSessionKey(readString(session.key))
+  if (agentId) return await getOpenClawWorkspace(agentId)
+
+  const openClawHome = getOpenClawHome()
+  return openClawHome ? join(openClawHome, 'workspace') : process.cwd()
+}
+
+async function runCodexExecFastReply(
   session: OpenClawSessionRow,
   text: string,
   onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
   options: { model?: string; thinking?: string; fastMode?: boolean } = {},
 ): Promise<string> {
+  const workspaceDir = await resolveSessionWorkspace(session)
   return new Promise((resolve, reject) => {
     const outputPath = join(tmpdir(), `codexclaw-fast-${randomUUID()}.txt`)
     const model = normalizeCodexExecModel(readString(options.model))
     const runtimeConfig = resolveAppServerRuntimeConfig()
     const timeoutMs = readPositiveIntegerEnv('OPENCLAW_CODEX_FAST_TIMEOUT_MS', DEFAULT_CODEX_FAST_TIMEOUT_MS)
-    const workspaceDir = readString(session.workspaceDir) || readString(session.cwd) || join(getOpenClawHome(), 'workspace-family-finance')
     const codexCmd = process.platform === 'win32'
       ? join(process.env.APPDATA || '', 'npm', 'codex.cmd')
       : 'codex'
@@ -1124,6 +1135,7 @@ async function persistFastReplyToSession(session: OpenClawSessionRow, text: stri
   const entry = store[sessionKey] && typeof store[sessionKey] === 'object' && !Array.isArray(store[sessionKey])
     ? store[sessionKey] as OpenClawSessionRow
     : session
+  const workspaceDir = await resolveSessionWorkspace({ ...session, ...entry, key: sessionKey })
   const sessionId = readString(entry.sessionId) || readString(session.sessionId) || randomUUID()
   const sessionFile = readString(entry.sessionFile) || readString(session.sessionFile) || join(openClawHome, 'agents', agentId, 'sessions', `${sessionId}.jsonl`)
   await mkdir(dirname(sessionFile), { recursive: true })
@@ -1164,6 +1176,7 @@ async function persistFastReplyToSession(session: OpenClawSessionRow, text: stri
       ...entry,
       sessionId,
       sessionFile,
+      workspaceDir,
       updatedAt: now,
       status: 'done',
       fastMode: true,
@@ -1233,6 +1246,7 @@ async function startSession(
 ): Promise<OpenClawSessionRow> {
   const sessionId = randomUUID()
   const agentId = await resolveConfiguredAgentId(rawAgentId)
+  const workspaceDir = await getOpenClawWorkspace(agentId)
   const sessionKey = `agent:${agentId}:explicit:${sessionId}`
   const model = normalizeOpenClawModelOverride(readString(options.model))
   const thinking = readString(options.thinking)
@@ -1261,6 +1275,7 @@ async function startSession(
     ...(patchedEntry ?? {}),
     key: resolvedSessionKey,
     sessionId: readString(patchedEntry?.sessionId) || readString(createdEntry?.sessionId) || sessionId,
+    workspaceDir: readString(patchedEntry?.workspaceDir) || readString(createdEntry?.workspaceDir) || workspaceDir,
     displayName: readString(patchedEntry?.displayName) || readString(createdEntry?.displayName) || text.slice(0, 80),
     updatedAt: readNumber(patchedEntry?.updatedAt) ?? readNumber(createdEntry?.updatedAt) ?? Date.now(),
     ...(options.fastMode === true ? { fastMode: true } : {}),

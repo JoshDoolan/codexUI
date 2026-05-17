@@ -46,6 +46,7 @@ import {
   renameOpenClawThread,
   type OpenClawAgentInfo,
   type OpenClawCommandInfo,
+  OPENCLAW_THREAD_ID_PREFIX,
   isOpenClawThreadId,
   startOpenClawThread,
   startOpenClawThreadTurnStream,
@@ -165,6 +166,16 @@ function loadSelectedOpenClawSpeedMode(): SpeedMode {
 function saveSelectedOpenClawSpeedMode(value: SpeedMode): void {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(SELECTED_OPENCLAW_SPEED_MODE_STORAGE_KEY, value === 'standard' ? 'standard' : 'fast')
+}
+
+function readOpenClawAgentIdFromThreadId(threadId: string): string {
+  if (!isOpenClawThreadId(threadId)) return ''
+  try {
+    const sessionKey = decodeURIComponent(threadId.slice(OPENCLAW_THREAD_ID_PREFIX.length))
+    return /^agent:([^:]+):/u.exec(sessionKey)?.[1] ?? ''
+  } catch {
+    return ''
+  }
 }
 
 function loadUnreadCutoffIso(): string {
@@ -1720,17 +1731,24 @@ export function useDesktopState() {
   }
 
   function setSelectedThreadId(nextThreadId: string): void {
-    if (selectedThreadId.value === nextThreadId) return
-    selectedThreadId.value = nextThreadId
-    saveSelectedThreadId(nextThreadId)
-    selectedModelId.value = readModelIdForThread(nextThreadId)
-    ensureAvailableModelIds(selectedModelId.value)
-    selectedCollaborationMode.value = readSelectedCollaborationMode(
-      selectedCollaborationModeByContext.value,
-      nextThreadId,
-    )
-    activeReasoningItemId = ''
-    shouldAutoScrollOnNextAgentEvent = false
+    const didChangeThread = selectedThreadId.value !== nextThreadId
+    if (didChangeThread) {
+      selectedThreadId.value = nextThreadId
+      saveSelectedThreadId(nextThreadId)
+      selectedModelId.value = readModelIdForThread(nextThreadId)
+      ensureAvailableModelIds(selectedModelId.value)
+      selectedCollaborationMode.value = readSelectedCollaborationMode(
+        selectedCollaborationModeByContext.value,
+        nextThreadId,
+      )
+      activeReasoningItemId = ''
+      shouldAutoScrollOnNextAgentEvent = false
+    }
+
+    const openClawAgentId = readOpenClawAgentIdFromThreadId(nextThreadId)
+    if (openClawAgentId && selectedOpenClawAgentId.value !== openClawAgentId) {
+      setSelectedOpenClawAgentId(openClawAgentId)
+    }
   }
 
   function setSelectedModelIdForThread(threadId: string, modelId: string): void {
