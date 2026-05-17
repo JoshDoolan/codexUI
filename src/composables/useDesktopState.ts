@@ -90,6 +90,7 @@ const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
 const SELECTED_SESSION_SOURCE_STORAGE_KEY = 'codex-web-local.selected-session-source.v1'
 const SELECTED_OPENCLAW_AGENT_STORAGE_KEY = 'codex-web-local.selected-openclaw-agent-id.v1'
+const SELECTED_OPENCLAW_SPEED_MODE_STORAGE_KEY = 'codex-web-local.selected-openclaw-speed-mode.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
@@ -150,6 +151,20 @@ function loadSelectedOpenClawAgentId(): string {
 function saveSelectedOpenClawAgentId(value: string): void {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(SELECTED_OPENCLAW_AGENT_STORAGE_KEY, value)
+}
+
+function normalizeSpeedMode(value: unknown): SpeedMode {
+  return value === 'standard' ? 'standard' : 'fast'
+}
+
+function loadSelectedOpenClawSpeedMode(): SpeedMode {
+  if (typeof window === 'undefined') return 'fast'
+  return normalizeSpeedMode(window.localStorage.getItem(SELECTED_OPENCLAW_SPEED_MODE_STORAGE_KEY))
+}
+
+function saveSelectedOpenClawSpeedMode(value: SpeedMode): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(SELECTED_OPENCLAW_SPEED_MODE_STORAGE_KEY, value === 'standard' ? 'standard' : 'fast')
 }
 
 function loadUnreadCutoffIso(): string {
@@ -1433,7 +1448,9 @@ export function useDesktopState() {
   )
   const selectedModelId = ref(readSelectedModel(selectedModelIdByContext.value, selectedThreadId.value))
   const selectedReasoningEffort = ref<ReasoningEffort | ''>('medium')
-  const selectedSpeedMode = ref<SpeedMode>('standard')
+  const selectedSpeedMode = ref<SpeedMode>(
+    selectedSessionSource.value === 'openclaw' ? loadSelectedOpenClawSpeedMode() : 'standard',
+  )
   const activeProviderId = ref('')
   const readStateByThreadId = ref<Record<string, string>>(loadReadStateMap())
   const unreadCutoffIso = ref(loadUnreadCutoffIso())
@@ -2022,14 +2039,18 @@ export function useDesktopState() {
       ) {
         selectedReasoningEffort.value = currentConfig.reasoningEffort
       }
-      selectedSpeedMode.value = currentConfig.speedMode
+      if (selectedSessionSource.value !== 'openclaw') {
+        selectedSpeedMode.value = currentConfig.speedMode
+      }
     } catch {
       // Keep chat UI usable even if model metadata is temporarily unavailable.
     }
   }
 
   function setSelectedSpeedModeForOpenClaw(mode: SpeedMode): void {
-    selectedSpeedMode.value = mode === 'fast' ? 'fast' : 'standard'
+    const nextMode = mode === 'standard' ? 'standard' : 'fast'
+    selectedSpeedMode.value = nextMode
+    saveSelectedOpenClawSpeedMode(nextMode)
   }
 
   function readOpenClawThinkingLevel(): string {
@@ -4717,6 +4738,9 @@ export function useDesktopState() {
     if (selectedSessionSource.value === normalizedSource) return
     selectedSessionSource.value = normalizedSource
     saveSelectedSessionSource(normalizedSource)
+    if (normalizedSource === 'openclaw') {
+      selectedSpeedMode.value = loadSelectedOpenClawSpeedMode()
+    }
     setSelectedThreadId('')
     projectGroups.value = []
     sourceGroups.value = []

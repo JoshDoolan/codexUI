@@ -179,11 +179,11 @@ async function buildOpenClawTextWithAttachments(
     prefix += '\nPlease read and follow the selected skill instructions where relevant.\n\n'
   }
   if (staged.length > 0) {
-    prefix += '# Files/images attached by the user:\n'
+    prefix += '# Files mentioned by the user:\n'
     for (const attachment of staged) {
-      prefix += `\n## ${attachment.label}\nLocal path: ${attachment.path}\n`
+      prefix += `\n## ${attachment.label}: ${attachment.path}\n`
     }
-    prefix += '\nPlease inspect the local file path(s) above with your file or image tools.\n\n'
+    prefix += '\n'
   }
   if (!prefix) return trimmedText
   const request = trimmedText || 'Please use the selected skill(s).'

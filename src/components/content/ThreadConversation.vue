@@ -697,6 +697,14 @@
               >
                 {{ liveOverlay.reasoningText }}
               </p>
+              <ul
+                v-else-if="liveOverlay.activityDetails.length > 0"
+                class="live-overlay-details"
+              >
+                <li v-for="detail in liveOverlay.activityDetails" :key="detail">
+                  {{ detail }}
+                </li>
+              </ul>
               <p v-if="liveOverlay.errorText" class="live-overlay-error">{{ liveOverlay.errorText }}</p>
             </article>
           </div>
@@ -4409,6 +4417,15 @@ onBeforeUnmount(() => {
 
 .live-overlay-reasoning::-webkit-scrollbar {
   display: none;
+}
+
+.live-overlay-details {
+  @apply m-0 list-none space-y-1 p-0 text-sm leading-5 text-zinc-500;
+}
+
+.live-overlay-details li {
+  @apply break-words;
+  overflow-wrap: anywhere;
 }
 
 .live-overlay-error {

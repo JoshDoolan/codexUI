@@ -3,14 +3,16 @@ import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
 import { appendFile, copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { tmpdir } from 'node:os'
 import express, { type RequestHandler } from 'express'
+import { resolveAppServerRuntimeConfig } from './appServerRuntimeConfig.js'
 
 const DEFAULT_GATEWAY_URL = 'ws://127.0.0.1:18789'
 const DEFAULT_OPENCLAW_ENTRY = 'C:\\Users\\JD\\AppData\\Roaming\\npm\\node_modules\\openclaw\\openclaw.mjs'
 const OPENCLAW_ID_PREFIX = 'openclaw::'
+const DEFAULT_CODEX_FAST_TIMEOUT_MS = 900_000
 
 type OpenClawSessionRow = Record<string, unknown> & {
   key?: string
@@ -828,6 +830,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
 async function waitForAssistantReply(
   sessionKey: string,
   baselineAssistantCount: number,
@@ -914,52 +921,167 @@ function buildSendArgs(session: OpenClawSessionRow, text: string, options: { mod
 
 function normalizeCodexExecModel(model: string): string {
   const normalized = normalizeOpenClawModelOverride(model)
+  if (normalized.startsWith('openai-codex/')) return normalized.slice('openai-codex/'.length)
   if (normalized.startsWith('codex/')) return normalized.slice('codex/'.length)
   if (normalized.startsWith('openai/')) return normalized.slice('openai/'.length)
   return normalized || 'gpt-5.4-mini'
 }
 
+function extractAttachmentPathFromPromptLine(line: string): string {
+  const localPathMatch = /^Local path:\s*(.+)$/iu.exec(line.trim())
+  if (localPathMatch) return localPathMatch[1]?.trim() ?? ''
+
+  const headingMatch = /^##\s+.+?:\s*(.+)$/u.exec(line.trim())
+  return headingMatch?.[1]?.trim() ?? ''
+}
+
+function extractImageAttachmentPathsFromPrompt(text: string): string[] {
+  const imageExtensions = new Set(['.avif', '.bmp', '.gif', '.jpg', '.jpeg', '.png', '.webp'])
+  const paths = new Set<string>()
+  for (const line of text.split(/\r?\n/u)) {
+    const candidate = normalizeSourcePath(extractAttachmentPathFromPromptLine(line))
+    if (!candidate || !isLikelyLocalPath(candidate)) continue
+    if (!imageExtensions.has(extname(candidate).toLowerCase())) continue
+    if (!existsSync(candidate)) continue
+    paths.add(candidate)
+  }
+  return [...paths]
+}
+
+function encodeOpenClawActivity(label: string, details: string[] = []): string {
+  return `__codexclaw_activity__:${JSON.stringify({ label, details })}`
+}
+
+function summarizeCodexExecItem(item: Record<string, unknown>): { label: string; details: string[] } | null {
+  const type = readString(item.type)
+  const name = readString(item.name) || readString(item.command) || readString(item.tool_name)
+  const text = readString(item.text) || readString(item.summary) || readString(item.result)
+
+  if (type.includes('tool') || type.includes('function') || name) {
+    return {
+      label: type.includes('output') || type.includes('result') ? 'OpenClaw tool returned' : 'Running OpenClaw tool',
+      details: [name || text || type || 'tool'].filter(Boolean).slice(0, 2),
+    }
+  }
+
+  if (type.includes('reasoning')) {
+    return {
+      label: 'OpenClaw is reasoning',
+      details: [text || 'Thinking through the request'],
+    }
+  }
+
+  if (type.includes('agent_message') || type.includes('message')) {
+    return {
+      label: 'OpenClaw is drafting',
+      details: text ? [text.slice(0, 240)] : ['Preparing response'],
+    }
+  }
+
+  return type ? { label: 'OpenClaw is working', details: [type] } : null
+}
+
+function summarizeCodexExecJsonLine(line: string): { label: string; details: string[] } | null {
+  try {
+    const row = JSON.parse(line) as Record<string, unknown>
+    const type = readString(row.type)
+    if (type === 'thread.started') {
+      return { label: 'OpenClaw fast mode started', details: ['Created Codex execution thread'] }
+    }
+    if (type === 'turn.started') {
+      return { label: 'OpenClaw is thinking', details: ['Model run started'] }
+    }
+    if (type === 'turn.completed') {
+      const usage = row.usage && typeof row.usage === 'object' && !Array.isArray(row.usage)
+        ? row.usage as Record<string, unknown>
+        : {}
+      const inputTokens = readNumber(usage.input_tokens)
+      const outputTokens = readNumber(usage.output_tokens)
+      const details = inputTokens !== null || outputTokens !== null
+        ? [`${inputTokens ?? 0} input tokens, ${outputTokens ?? 0} output tokens`]
+        : ['Final response ready']
+      return { label: 'OpenClaw finished thinking', details }
+    }
+    if (type === 'item.started' || type === 'item.completed') {
+      const item = row.item && typeof row.item === 'object' && !Array.isArray(row.item)
+        ? row.item as Record<string, unknown>
+        : {}
+      return summarizeCodexExecItem(item)
+    }
+    return type ? { label: 'OpenClaw is working', details: [type] } : null
+  } catch {
+    return null
+  }
+}
+
 function runCodexExecFastReply(
   session: OpenClawSessionRow,
   text: string,
+  onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
   options: { model?: string; thinking?: string; fastMode?: boolean } = {},
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const outputPath = join(tmpdir(), `codexclaw-fast-${randomUUID()}.txt`)
     const model = normalizeCodexExecModel(readString(options.model))
+    const runtimeConfig = resolveAppServerRuntimeConfig()
+    const timeoutMs = readPositiveIntegerEnv('OPENCLAW_CODEX_FAST_TIMEOUT_MS', DEFAULT_CODEX_FAST_TIMEOUT_MS)
     const workspaceDir = readString(session.workspaceDir) || readString(session.cwd) || join(getOpenClawHome(), 'workspace-family-finance')
     const codexCmd = process.platform === 'win32'
       ? join(process.env.APPDATA || '', 'npm', 'codex.cmd')
       : 'codex'
+    const imageArgs = extractImageAttachmentPathsFromPrompt(text).flatMap((path) => ['--image', path])
     const args = [
       'exec',
+      '-c',
+      `approval_policy="${runtimeConfig.approvalPolicy}"`,
+      '-c',
+      `sandbox_mode="${runtimeConfig.sandboxMode}"`,
       '--ephemeral',
       '--skip-git-repo-check',
       '--cd',
       workspaceDir,
       '--model',
       model,
+      '--json',
+      ...imageArgs,
       '--output-last-message',
       outputPath,
-      text,
+      '-',
     ]
     const startedAtMs = Date.now()
     const child = process.platform === 'win32'
       ? spawn('cmd.exe', ['/d', '/s', '/c', codexCmd, ...args], {
         windowsHide: true,
-        stdio: ['ignore', 'ignore', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       })
       : spawn(codexCmd, args, {
       windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
     let stderr = ''
+    let stdoutBuffer = ''
+    child.stdin?.end(text)
     const timer = setTimeout(() => {
       child.kill()
-      reject(new Error('Codex fast mode timed out'))
-    }, 120_000)
+      reject(new Error(`Codex fast mode timed out after ${Math.round(timeoutMs / 1000)}s`))
+    }, timeoutMs)
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += String(chunk)
+      let newlineIndex = stdoutBuffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim()
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1)
+        const activity = line ? summarizeCodexExecJsonLine(line) : null
+        if (activity) {
+          onOutput(encodeOpenClawActivity(activity.label, activity.details), 'stdout')
+        }
+        newlineIndex = stdoutBuffer.indexOf('\n')
+      }
+    })
     child.stderr.on('data', (chunk) => {
       stderr += String(chunk)
+      const detail = String(chunk).trim()
+      if (detail) onOutput(detail, 'stderr')
     })
     child.on('error', (error) => {
       clearTimeout(timer)
@@ -968,12 +1090,19 @@ function runCodexExecFastReply(
     child.on('close', async (code) => {
       clearTimeout(timer)
       try {
+        const finalLine = stdoutBuffer.trim()
+        const finalActivity = finalLine ? summarizeCodexExecJsonLine(finalLine) : null
+        if (finalActivity) {
+          onOutput(encodeOpenClawActivity(finalActivity.label, finalActivity.details), 'stdout')
+        }
         const reply = existsSync(outputPath) ? (await readFile(outputPath, 'utf8')).trim() : ''
         await unlink(outputPath).catch(() => {})
         console.info('[openclaw-fast-codex]', JSON.stringify({
           code,
           durationMs: Date.now() - startedAtMs,
           model,
+          sandboxMode: runtimeConfig.sandboxMode,
+          approvalPolicy: runtimeConfig.approvalPolicy,
         }))
         if (code !== 0) throw new Error((stderr || `codex exited with code ${code}`).trim())
         resolve(reply || 'OK')
@@ -1063,7 +1192,7 @@ async function sendToSessionStreaming(
   const runId = randomUUID()
   const turnStartedAtMs = Date.now()
   if (fastMode) {
-    const reply = await runCodexExecFastReply(session, text, options)
+    const reply = await runCodexExecFastReply(session, text, onOutput, options)
     await persistFastReplyToSession(session, text, reply)
     onOutput('Codex fast mode reply received', 'stdout')
     return
@@ -1127,13 +1256,13 @@ async function startSession(
   const createdEntry = createResult.entry && typeof createResult.entry === 'object'
     ? createResult.entry as Record<string, unknown>
     : null
-  const session = {
+  const session: OpenClawSessionRow = {
     ...(createdEntry ?? {}),
     ...(patchedEntry ?? {}),
     key: resolvedSessionKey,
     sessionId: readString(patchedEntry?.sessionId) || readString(createdEntry?.sessionId) || sessionId,
     displayName: readString(patchedEntry?.displayName) || readString(createdEntry?.displayName) || text.slice(0, 80),
-    updatedAt: patchedEntry?.updatedAt ?? createdEntry?.updatedAt ?? Date.now(),
+    updatedAt: readNumber(patchedEntry?.updatedAt) ?? readNumber(createdEntry?.updatedAt) ?? Date.now(),
     ...(options.fastMode === true ? { fastMode: true } : {}),
     ...(thinking ? { thinkingLevel: thinking } : {}),
   }
@@ -1150,6 +1279,21 @@ function asyncHandler(handler: RequestHandler): RequestHandler {
 function writeSse(res: express.Response, event: string, data: unknown): void {
   res.write(`event: ${event}\n`)
   res.write(`data: ${JSON.stringify(data)}\n\n`)
+}
+
+function readEncodedOpenClawActivity(chunk: string): { label: string; details: string[] } | null {
+  const prefix = '__codexclaw_activity__:'
+  if (!chunk.startsWith(prefix)) return null
+  try {
+    const parsed = JSON.parse(chunk.slice(prefix.length)) as Record<string, unknown>
+    const label = readString(parsed.label) || 'OpenClaw is working'
+    const details = Array.isArray(parsed.details)
+      ? parsed.details.map((detail) => readString(detail)).filter(Boolean).slice(0, 5)
+      : []
+    return { label, details }
+  } catch {
+    return null
+  }
 }
 
 function readOpenClawRunOptions(body: unknown): { model?: string; thinking?: string; fastMode?: boolean } {
@@ -1480,6 +1624,11 @@ export function createOpenClawBridgeMiddleware(): RequestHandler {
       await sendToSessionStreaming(session, text, (chunk, stream) => {
         if (closed) return
         if (!firstActivityAtMs) firstActivityAtMs = Date.now()
+        const encodedActivity = readEncodedOpenClawActivity(chunk)
+        if (encodedActivity) {
+          writeSse(res, 'activity', encodedActivity)
+          return
+        }
         const detail = chunk.trim().slice(0, 500)
         if (!detail) return
         writeSse(res, 'activity', {
