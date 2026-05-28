@@ -2,7 +2,11 @@
   <DesktopLayout :is-sidebar-collapsed="isSidebarCollapsed" @close-sidebar="setSidebarCollapsed(true)">
     <template #sidebar>
       <section class="sidebar-root">
-        <div class="sidebar-scrollable">
+        <div
+          ref="sidebarScrollableRef"
+          class="sidebar-scrollable"
+          @scroll="onSidebarScroll"
+        >
           <SidebarThreadControls
             v-if="!isSidebarCollapsed"
             class="sidebar-thread-controls-host"
@@ -110,15 +114,17 @@
             @select="onSelectThread"
             @archive="onArchiveThread" @start-new-thread="onStartNewThread" @rename-project="onRenameProject"
             @browse-thread-files="onBrowseThreadFiles"
+            @save-thread-project="onSaveThreadProject"
             @browse-project-files="onBrowseProjectFiles"
+            @save-project="onSaveProject"
             @request-project-git-status="onRequestProjectGitStatus"
             @create-project-worktree="onCreateProjectWorktree"
             @rename-thread="onRenameThread"
             @fork-thread="onForkThread"
             @remove-project="onRemoveProject" @reorder-project="onReorderProject"
-            @export-thread="onExportThread"
+            @copy-thread-chat="onCopyThreadChat"
             @automations-changed="onAutomationsChanged"
-            @start-new-chat="onStartNewThreadFromToolbar" />
+            @start-new-chat="onStartProjectlessNewChat" />
         </div>
 
         <div
@@ -159,7 +165,10 @@
                   </button>
                 </div>
                 <template v-if="!isAccountsSectionCollapsed">
-                  <p v-if="accountActionError" class="sidebar-settings-account-error">{{ accountActionError }}</p>
+                  <div v-if="accountActionError" class="sidebar-settings-account-error visible-error-with-feedback">
+                    <span>{{ accountActionError }}</span>
+                    <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, accountActionError)">{{ t('Send feedback') }}</a>
+                  </div>
                   <div class="sidebar-settings-account-login">
                     <button
                       class="sidebar-settings-account-login-button"
@@ -185,7 +194,7 @@
                   <div v-else class="sidebar-settings-account-list">
                   <article
                     v-for="account in accounts"
-                    :key="account.accountId"
+                    :key="account.storageId"
                     class="sidebar-settings-account-item"
                     :class="{
                       'is-active': account.isActive,
@@ -194,8 +203,8 @@
                       'is-remove-visible': isRemoveVisible(account),
                     }"
                     :title="buildAccountTitle(account)"
-                    @mouseenter="onAccountCardPointerEnter(account.accountId)"
-                    @mouseleave="onAccountCardPointerLeave(account.accountId)"
+                    @mouseenter="onAccountCardPointerEnter(account.storageId)"
+                    @mouseleave="onAccountCardPointerLeave(account.storageId)"
                   >
                     <div class="sidebar-settings-account-main">
                       <p class="sidebar-settings-account-email">{{ account.email || t('Account') }}</p>
@@ -214,7 +223,7 @@
                         class="sidebar-settings-account-switch"
                         type="button"
                         :disabled="isAccountActionDisabled(account) || account.isActive || isAccountUnavailable(account)"
-                        @click="onSwitchAccount(account.accountId)"
+                        @click="onSwitchAccount(account.storageId)"
                       >
                         {{ getAccountSwitchLabel(account) }}
                       </button>
@@ -226,7 +235,7 @@
                         }"
                         type="button"
                         :disabled="isAccountActionDisabled(account)"
-                        @click="onRemoveAccount(account.accountId)"
+                        @click="onRemoveAccount(account.storageId)"
                       >
                         {{ getAccountRemoveLabel(account) }}
                       </button>
@@ -249,13 +258,14 @@
               </button>
               <div class="sidebar-settings-row sidebar-settings-row--select" :title="t('Choose the interface language for the app.')">
                 <span class="sidebar-settings-label">{{ t('UI language') }}</span>
-                <select
-                  class="sidebar-settings-provider-select"
-                  :value="uiLanguage"
-                  @change="setUiLanguage(($event.target as HTMLSelectElement).value as 'en' | 'zh-CN')"
-                >
-                  <option v-for="option in uiLanguageOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-                </select>
+                <ComposerDropdown
+                  class="sidebar-settings-provider-dropdown"
+                  :model-value="uiLanguage"
+                  :options="uiLanguageOptions"
+                  :placeholder="t('UI language')"
+                  menu-align="end"
+                  @update:model-value="setUiLanguage($event as 'en' | 'zh-CN')"
+                />
               </div>
               <button class="sidebar-settings-row" type="button" :title="SETTINGS_HELP.chatWidth" @click="cycleChatWidth">
                 <span class="sidebar-settings-label">{{ t('Chat width') }}</span>
@@ -269,23 +279,31 @@
                 <span class="sidebar-settings-label">{{ t('Auto send dictation') }}</span>
                 <span class="sidebar-settings-toggle" :class="{ 'is-on': dictationAutoSend }" />
               </button>
+              <a
+                v-if="hasVisibleFeedbackError"
+                class="sidebar-settings-row sidebar-settings-feedback-row"
+                :href="feedbackMailto"
+                @click="prepareFeedbackLink"
+              >
+                <span class="sidebar-settings-label">{{ t('Send feedback') }}</span>
+                <span class="sidebar-settings-value">{{ t('Issue detected') }}</span>
+              </a>
 
               <div class="sidebar-settings-row sidebar-settings-row--select" :title="t('Choose the API provider for the Codex backend')">
                 <span class="sidebar-settings-label">{{ t('Provider') }}</span>
-                <select
-                  class="sidebar-settings-provider-select"
-                  :value="selectedProvider"
+                <ComposerDropdown
+                  class="sidebar-settings-provider-dropdown"
+                  :model-value="selectedProvider"
+                  :options="providerDropdownOptions"
+                  :placeholder="t('Provider')"
                   :disabled="freeModeLoading"
-                  @change="onProviderChange(($event.target as HTMLSelectElement).value)"
-                >
-                  <option value="codex">Codex</option>
-                  <option value="openrouter">OpenRouter</option>
-                  <option value="opencode-zen">OpenCode Zen</option>
-                  <option value="custom">Custom endpoint</option>
-                </select>
+                  menu-align="end"
+                  @update:model-value="onProviderChange"
+                />
               </div>
               <div v-if="providerError" class="sidebar-settings-row sidebar-settings-error">
-                {{ providerError }}
+                <span>{{ providerError }}</span>
+                <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, providerError)">{{ t('Send feedback') }}</a>
               </div>
               <div v-if="selectedProvider === 'openrouter'" class="sidebar-settings-row sidebar-settings-row--input">
                 <div class="sidebar-settings-provider-info">
@@ -466,7 +484,8 @@
                   {{ t('Put one Telegram user ID per line or separate them with commas. Use `*` to allow all Telegram users. Unauthorized users will see their own ID in the rejection message so they can copy it here.') }}
                 </div>
                 <div v-if="telegramConfigError" class="sidebar-settings-telegram-error">
-                  {{ telegramConfigError }}
+                  <span>{{ telegramConfigError }}</span>
+                  <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, telegramConfigError)">{{ t('Send feedback') }}</a>
                 </div>
                 <div class="sidebar-settings-telegram-actions">
                   <button
@@ -552,6 +571,7 @@
               :placeholder="terminalCommandPlaceholder"
               :selected-prefix-icon="IconTablerTerminal"
               :icon-only="true"
+              menu-align="end"
               :empty-label="t('No commands')"
               @update:model-value="onSelectHeaderTerminalCommand"
             />
@@ -564,19 +584,25 @@
               :head-date="currentThreadHeadDate"
               :detached="isThreadDetachedHead"
               :dirty="isThreadWorktreeDirty"
+              :worktree-change-summary="threadWorktreeChangeSummary"
               :branches="threadBranchOptions"
               :commits-by-branch="threadBranchCommitsByBranch"
               :commits-loading-for="threadBranchCommitsLoadingFor"
               :commits-error="threadBranchCommitsError"
+              :commit-files-by-sha="threadCommitFilesBySha"
+              :commit-files-loading-for="threadCommitFilesLoadingFor"
+              :commit-files-error="threadCommitFilesError"
               :loading="isLoadingThreadBranches"
               :busy="isSwitchingThreadBranch"
               :error="threadBranchError"
               :review-open="isReviewPaneOpen"
               :show-review="route.name === 'thread' && selectedThreadId.length > 0"
-              @toggle-review="isReviewPaneOpen = !isReviewPaneOpen"
+              @toggle-review="onToggleContentHeaderReview"
               @checkout-branch="onCheckoutContentHeaderBranch"
               @reset-branch-to-commit="onResetContentHeaderBranchToCommit"
               @load-commits="loadThreadBranchCommits"
+              @load-commit-files="loadThreadCommitFiles"
+              @open-commit-file="onOpenContentHeaderCommitFile"
             />
           </template>
         </ContentHeader>
@@ -622,6 +648,18 @@
                   <button class="new-thread-folder-action" type="button" @click="onOpenProjectSetupModal">
                     {{ t('Create Project') }}
                   </button>
+                  <button class="new-thread-folder-action" type="button" :disabled="isProjectImporting" @click="onChooseProjectImportZip">
+                    {{ isProjectImporting ? t('Importing…') : t('Import Project') }}
+                  </button>
+                  <input
+                    ref="projectImportInputRef"
+                    class="new-thread-project-import-input"
+                    type="file"
+                    accept=".zip,application/zip"
+                    tabindex="-1"
+                    aria-hidden="true"
+                    @change="onDirectProjectImportFileChange"
+                  />
                 </div>
                 <section v-if="showFirstLaunchPluginsCard" class="new-thread-launch-card" aria-label="Plugins and Apps announcement">
                   <div class="new-thread-launch-card-copy">
@@ -725,7 +763,10 @@
                             {{ createFolderSubmitLabel }}
                           </button>
                         </div>
-                        <p v-if="createFolderError" class="new-thread-open-folder-error">{{ createFolderError }}</p>
+                        <div v-if="createFolderError" class="new-thread-open-folder-error visible-error-with-feedback">
+                          <span>{{ createFolderError }}</span>
+                          <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, createFolderError)">{{ t('Send feedback') }}</a>
+                        </div>
                       </div>
                       <input
                         ref="existingFolderFilterInputRef"
@@ -736,7 +777,10 @@
                         @keydown.esc.prevent="onCloseExistingFolderPanel"
                       />
                       <div v-if="existingFolderError" class="new-thread-open-folder-error-actions">
-                        <p class="new-thread-open-folder-error">{{ existingFolderError }}</p>
+                        <div class="new-thread-open-folder-error visible-error-with-feedback">
+                          <span>{{ existingFolderError }}</span>
+                          <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, existingFolderError)">{{ t('Send feedback') }}</a>
+                        </div>
                         <button
                           class="new-thread-folder-action"
                           type="button"
@@ -830,7 +874,7 @@
                           @keydown.enter.prevent="onSubmitProjectSetup"
                         />
                       </label>
-                      <label v-else class="new-thread-project-field">
+                      <label v-else-if="projectSetupMode === 'clone'" class="new-thread-project-field">
                         <span class="new-thread-open-folder-label">{{ t('GitHub repository URL') }}</span>
                         <input
                           ref="projectSetupPrimaryInputRef"
@@ -842,7 +886,10 @@
                           @keydown.enter.prevent="onSubmitProjectSetup"
                         />
                       </label>
-                      <p v-if="projectSetupError" class="new-thread-open-folder-error">{{ projectSetupError }}</p>
+                      <div v-if="projectSetupError" class="new-thread-open-folder-error visible-error-with-feedback">
+                        <span>{{ projectSetupError }}</span>
+                        <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, projectSetupError)">{{ t('Send feedback') }}</a>
+                      </div>
                       <div class="new-thread-project-modal-actions">
                         <button class="new-thread-folder-action" type="button" :disabled="isProjectSetupSubmitting" @click="onCloseProjectSetupModal">
                           {{ t('Cancel') }}
@@ -903,6 +950,10 @@
               </div>
 
               <div class="composer-with-queue">
+                <div v-if="codexCliMissingError" class="composer-runtime-error" role="alert">
+                  <span>{{ t(codexCliMissingError) }}</span>
+                  <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, codexCliMissingError)">{{ t('Send feedback') }}</a>
+                </div>
                 <ThreadTerminalPanel
                   v-if="homeTerminalOpen && composerCwd"
                   ref="homeTerminalPanelRef"
@@ -951,6 +1002,8 @@
                 :thread-id="selectedThreadId"
                 :cwd="composerCwd"
                 :is-thread-in-progress="isSelectedThreadInProgress"
+                :initial-file-path="reviewInitialFilePath"
+                :commit-sha="reviewInitialCommitSha"
                 @close="isReviewPaneOpen = false"
               />
 
@@ -970,6 +1023,10 @@
                 </div>
 
                 <div class="composer-with-queue">
+                  <div v-if="codexCliMissingError" class="composer-runtime-error" role="alert">
+                    <span>{{ t(codexCliMissingError) }}</span>
+                    <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, codexCliMissingError)">{{ t('Send feedback') }}</a>
+                  </div>
                   <QueuedMessages
                     :messages="selectedThreadQueuedMessages"
                     @edit="onEditQueuedMessage"
@@ -1036,6 +1093,46 @@
       </section>
     </template>
   </DesktopLayout>
+  <div v-if="projectZipExportStatus.phase !== 'idle'" class="project-zip-modal-backdrop" role="presentation">
+    <div class="project-zip-modal" role="dialog" aria-modal="true" :aria-label="t('Export Project')" @click.stop>
+      <div class="project-zip-modal-header">
+        <h2 class="project-zip-modal-title">{{ t('Export Project') }}</h2>
+        <button
+          class="project-zip-modal-close"
+          type="button"
+          :aria-label="t('Close')"
+          :disabled="projectZipExportStatus.phase === 'exporting'"
+          @click="onCloseProjectZipExportModal"
+        >
+          ×
+        </button>
+      </div>
+      <p class="project-zip-modal-copy">
+        {{ projectZipExportStatus.phase === 'exporting' ? t('Preparing project ZIP...') : projectZipExportStatus.fileName }}
+      </p>
+      <div class="project-zip-progress-label" role="status" aria-live="polite">
+        <span>{{ projectZipExportStatus.phase === 'exporting' ? t('Exporting') : t('Ready') }}</span>
+        <span>{{ projectZipProgressText }}</span>
+      </div>
+      <div class="project-zip-progress-track">
+        <div class="project-zip-progress-fill" :style="{ width: projectZipProgressWidth }" />
+      </div>
+      <p v-if="projectZipExportStatus.error" class="project-zip-modal-error" role="alert">
+        {{ projectZipExportStatus.error }}
+      </p>
+      <div class="project-zip-modal-actions">
+        <button class="project-zip-modal-cancel" type="button" :disabled="projectZipExportStatus.phase === 'exporting'" @click="onCloseProjectZipExportModal">
+          {{ t('Close') }}
+        </button>
+        <button class="project-zip-modal-action" type="button" :disabled="!projectZipExportStatus.blob" @click="onDownloadProjectZipExport">
+          {{ t('Download') }}
+        </button>
+        <button class="project-zip-modal-action project-zip-modal-action-primary" type="button" :disabled="!projectZipExportStatus.blob" @click="onShareProjectZipExport">
+          {{ t('Share') }}
+        </button>
+      </div>
+    </div>
+  </div>
   <div
     v-if="isCodexLoginModalOpen"
     class="codex-login-modal-backdrop"
@@ -1083,7 +1180,10 @@
         :placeholder="t('Paste localhost callback URL')"
         :disabled="isCompletingCodexLogin"
       >
-      <p v-if="accountActionError" class="codex-login-modal-error">{{ accountActionError }}</p>
+      <div v-if="accountActionError" class="codex-login-modal-error visible-error-with-feedback">
+        <span>{{ accountActionError }}</span>
+        <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, accountActionError)">{{ t('Send feedback') }}</a>
+      </div>
       <div class="codex-login-modal-actions">
         <button
           class="codex-login-modal-cancel"
@@ -1127,6 +1227,7 @@ import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
+import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1134,9 +1235,12 @@ import {
   createPermanentWorktree,
   createWorktree,
   createProjectlessThreadDirectory,
+  downloadProjectZip,
   getGitBranchState,
   getGitBranchCommits,
+  getGitCommitFiles,
   getGitRepositoryStatus,
+  getReviewSummary,
   getWorktreeBranchOptions,
   getAccounts,
   completeCodexLogin,
@@ -1149,6 +1253,7 @@ import {
   getThreadTerminalQuickCommands,
   getThreadTerminalStatus,
   getWorkspaceRootsState,
+  importProjectZip,
   listLocalDirectories,
   openProjectRoot,
   persistFirstLaunchPluginsCardPreference,
@@ -1161,9 +1266,10 @@ import {
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
+import { copyTextToClipboard } from './utils/clipboard'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -1360,6 +1466,7 @@ const {
   selectedModelId,
   selectedReasoningEffort,
   selectedSpeedMode,
+  codexCliMissingError,
   installedSkills,
   accountRateLimitSnapshots,
   messages,
@@ -1372,6 +1479,7 @@ const {
   isInterruptingTurn,
   isSelectedThreadInterruptPending,
   isUpdatingSpeedMode,
+  error: desktopError,
   refreshAll,
   setSelectedSessionSource,
   setSelectedOpenClawAgentId,
@@ -1427,6 +1535,22 @@ type AutomationEditRequest = {
 }
 const sidebarThreadTreeRef = ref<SidebarThreadTreeExposed | null>(null)
 const automationsPanelRef = ref<AutomationsPanelExposed | null>(null)
+const {
+  buildFeedbackMailto,
+  feedbackMailtoBase,
+  recordVisibleFailure,
+} = useFeedbackDiagnostics()
+const feedbackMailto = feedbackMailtoBase()
+
+function prepareFeedbackLink(event: MouseEvent, message?: string): void {
+  if (message) {
+    recordVisibleFailure(message)
+  }
+  const target = event.currentTarget
+  if (target instanceof HTMLAnchorElement) {
+    target.href = buildFeedbackMailto()
+  }
+}
 const homeThreadComposerRef = ref<ThreadComposerExposed | null>(null)
 const threadComposerRef = ref<ThreadComposerExposed | null>(null)
 const threadConversationRef = ref<{ jumpToLatest: () => void } | null>(null)
@@ -1456,6 +1580,14 @@ const workspaceRootOptionsState = ref<{ order: string[]; labels: Record<string, 
   labels: {},
   projectOrder: [],
 })
+const projectZipExportStatus = ref<{ phase: 'idle' | 'exporting' | 'ready'; loaded: number; total: number | null; blob: Blob | null; fileName: string; error: string }>({
+  phase: 'idle',
+  loaded: 0,
+  total: null,
+  blob: null,
+  fileName: '',
+  error: '',
+})
 const worktreeInitStatus = ref<{ phase: 'idle' | 'running' | 'error'; title: string; message: string }>({
   phase: 'idle',
   title: '',
@@ -1464,6 +1596,7 @@ const worktreeInitStatus = ref<{ phase: 'idle' | 'running' | 'error'; title: str
 const isSidebarCollapsed = ref(loadSidebarCollapsed())
 const sidebarSearchQuery = ref('')
 const isSidebarSearchVisible = ref(false)
+const sidebarScrollableRef = ref<HTMLElement | null>(null)
 const sidebarSearchInputRef = ref<HTMLInputElement | null>(null)
 const settingsAreaRef = ref<HTMLElement | null>(null)
 const settingsPanelRef = ref<HTMLElement | null>(null)
@@ -1471,13 +1604,20 @@ const settingsButtonRef = ref<HTMLElement | null>(null)
 const serverMatchedThreadIds = ref<string[] | null>(null)
 let threadSearchTimer: ReturnType<typeof setTimeout> | null = null
 let terminalKeyboardFocusFallbackTimer: ReturnType<typeof setTimeout> | null = null
+let sidebarScrollTop = 0
+let sidebarScrollRestoreRequestId = 0
+let isRestoringSidebarScroll = false
 let threadBranchesRequestId = 0
 let threadBranchCommitsRequestId = 0
+let threadCommitFilesRequestId = 0
+let threadWorktreeSummaryRequestId = 0
 const defaultNewProjectName = ref('New Project (1)')
 const homeDirectory = ref('')
 const isSettingsOpen = ref(false)
 const isAccountsSectionCollapsed = ref(loadAccountsSectionCollapsed())
 const isReviewPaneOpen = ref(false)
+const reviewInitialFilePath = ref('')
+const reviewInitialCommitSha = ref('')
 const threadBranchOptions = ref<WorktreeBranchOption[]>([])
 const currentThreadBranch = ref<string | null>(null)
 const currentThreadHeadSha = ref<string | null>(null)
@@ -1485,12 +1625,21 @@ const currentThreadHeadSubject = ref<string | null>(null)
 const currentThreadHeadDate = ref<string | null>(null)
 const isThreadDetachedHead = ref(false)
 const isThreadWorktreeDirty = ref(false)
+const threadWorktreeChangeSummary = ref({ addedLineCount: 0, removedLineCount: 0 })
 const threadBranchError = ref('')
 const threadBranchCommitsByBranch = ref<Record<string, GitCommitOption[]>>({})
 const threadBranchCommitsLoadingFor = ref('')
 const threadBranchCommitsError = ref('')
+const threadCommitFilesBySha = ref<Record<string, GitCommitFileChange[]>>({})
+const threadCommitFilesLoadingFor = ref('')
+const threadCommitFilesError = ref('')
 const isLoadingThreadBranches = ref(false)
 const isSwitchingThreadBranch = ref(false)
+
+function toThreadBranchCommitsKey(branch: string, includeResetHistory: boolean): string {
+  return `${branch}\u0000${includeResetHistory ? 'with-reset-history' : 'without-reset-history'}`
+}
+
 const createFolderInputRef = ref<HTMLInputElement | null>(null)
 const accounts = ref<UiAccountEntry[]>([])
 const isRefreshingAccounts = ref(false)
@@ -1522,6 +1671,20 @@ const dictationClickToToggle = ref(loadBoolPref(DICTATION_CLICK_TO_TOGGLE_KEY, f
 const dictationAutoSend = ref(loadBoolPref(DICTATION_AUTO_SEND_KEY, true))
 const dictationLanguage = ref(loadDictationLanguagePref())
 const dictationLanguageOptions = computed(() => buildDictationLanguageOptions())
+const projectZipProgressText = computed(() => {
+  const { loaded, total } = projectZipExportStatus.value
+  const loadedLabel = formatByteCount(loaded)
+  if (total && total > 0) {
+    return `${loadedLabel} / ${formatByteCount(total)}`
+  }
+  return loaded > 0 ? loadedLabel : t('Preparing...')
+})
+const projectZipProgressWidth = computed(() => {
+  const { loaded, total, phase } = projectZipExportStatus.value
+  if (phase === 'ready') return '100%'
+  if (!total || total <= 0) return loaded > 0 ? '55%' : '20%'
+  return `${Math.min(100, Math.max(5, Math.round((loaded / total) * 100)))}%`
+})
 const showFirstLaunchPluginsCard = ref(false)
 const freeModeEnabled = ref(false)
 const freeModeLoading = ref(false)
@@ -1531,6 +1694,12 @@ const freeModeCustomKeyMasked = ref<string | null>(null)
 const freeModeCustomKeySaving = ref(false)
 const providerError = ref('')
 const selectedProvider = ref<'codex' | 'openrouter' | 'opencode-zen' | 'custom'>('codex')
+const providerDropdownOptions = computed(() => [
+  { value: 'codex', label: t('Codex') },
+  { value: 'openrouter', label: t('OpenRouter') },
+  { value: 'opencode-zen', label: t('OpenCode Zen') },
+  { value: 'custom', label: t('Custom endpoint') },
+])
 const customEndpointUrl = ref('')
 const customEndpointKey = ref('')
 const customEndpointWireApi = ref<'responses' | 'chat'>('responses')
@@ -1550,9 +1719,11 @@ const projectSetupMode = ref<'create' | 'clone'>('create')
 const projectSetupBaseDir = ref('')
 const projectNameDraft = ref('')
 const githubCloneUrlDraft = ref('')
+const isProjectImporting = ref(false)
 const projectSetupError = ref('')
 const isProjectSetupSubmitting = ref(false)
 const projectSetupPrimaryInputRef = ref<HTMLInputElement | null>(null)
+const projectImportInputRef = ref<HTMLInputElement | null>(null)
 const isExistingFolderPickerOpen = ref(false)
 const existingFolderPathInputRef = ref<HTMLInputElement | null>(null)
 const existingFolderFilterInputRef = ref<HTMLInputElement | null>(null)
@@ -1565,6 +1736,19 @@ const isExistingFolderLoading = ref(false)
 const isOpeningExistingFolder = ref(false)
 const showHiddenFolders = ref(false)
 const existingFolderFilter = ref('')
+const visibleFeedbackErrors = [
+  desktopError,
+  codexCliMissingError,
+  threadBranchError,
+  threadBranchCommitsError,
+  accountActionError,
+  providerError,
+  telegramConfigError,
+  createFolderError,
+  projectSetupError,
+  existingFolderError,
+]
+const hasVisibleFeedbackError = computed(() => visibleFeedbackErrors.some((entry) => entry.value.trim().length > 0))
 const telegramStatus = ref<TelegramStatus>({
   configured: false,
   active: false,
@@ -1582,6 +1766,8 @@ const visualViewportOffsetTop = ref(typeof window !== 'undefined' ? window.visua
 const layoutViewportHeight = ref(typeof window !== 'undefined' ? window.innerHeight : 0)
 let accountStatePollTimer: number | null = null
 let isAccountStatePollInFlight = false
+let externalCodexAuthAvailable = false
+let externalAuthImportAttempted = false
 let existingFolderBrowseRequestId = 0
 
 const routeThreadId = computed(() => {
@@ -1953,9 +2139,11 @@ const createFolderSubmitLabel = computed(() => {
 })
 const projectSetupSubmitLabel = computed(() => {
   if (isProjectSetupSubmitting.value) {
-    return projectSetupMode.value === 'clone' ? t('Cloning…') : t('Creating…')
+    if (projectSetupMode.value === 'clone') return t('Cloning…')
+    return t('Creating…')
   }
-  return projectSetupMode.value === 'clone' ? t('Clone repository') : t('Create project')
+  if (projectSetupMode.value === 'clone') return t('Clone repository')
+  return t('Create project')
 })
 const canBrowseExistingFolderParent = computed(() => {
   const current = existingFolderBrowsePath.value.trim()
@@ -2069,6 +2257,16 @@ onMounted(() => {
   void refreshTerminalQuickCommands()
 })
 
+watch(visibleFeedbackErrors, (values, oldValues) => {
+  values.forEach((value, index) => {
+    if (value === oldValues[index]) return
+    const message = value.trim()
+    if (message) {
+      recordVisibleFailure(message)
+    }
+  })
+})
+
 onUnmounted(() => {
   document.removeEventListener('pointerdown', onDocumentPointerDown)
   window.removeEventListener('keydown', onWindowKeyDown)
@@ -2147,8 +2345,37 @@ watch(accounts, () => {
   }, 1500)
 }, { deep: true })
 
+watch(accountRateLimitSnapshots, () => {
+  void maybeImportExternalCodexAuthAccount().then((imported) => {
+    if (!imported) return
+    void refreshAll({
+      includeSelectedThreadMessages: false,
+      providerChanged: true,
+      awaitAncillaryRefreshes: true,
+    })
+  })
+}, { deep: true })
+
+async function maybeImportExternalCodexAuthAccount(): Promise<boolean> {
+  if (!externalCodexAuthAvailable) return false
+  if (externalAuthImportAttempted) return false
+  if (selectedProvider.value !== 'codex') return false
+  if (accounts.value.length > 0) return false
+  if (accountRateLimitSnapshots.value.length === 0) return false
+  externalAuthImportAttempted = true
+  const previousAccountsJson = JSON.stringify(accounts.value.map((account) => account.accountId).sort())
+  try {
+    const result = await refreshAccountsFromAuth()
+    accounts.value = result.accounts
+  } catch {
+    await loadAccountsState({ silent: true })
+  }
+  const nextAccountsJson = JSON.stringify(accounts.value.map((account) => account.accountId).sort())
+  return previousAccountsJson !== nextAccountsJson
+}
+
 function onSkillsChanged(): void {
-  void refreshSkills()
+  void refreshSkills({ force: true })
 }
 
 async function refreshTelegramStatus(): Promise<void> {
@@ -2240,6 +2467,57 @@ function clearSidebarSearch(): void {
   sidebarSearchInputRef.value?.focus()
 }
 
+function getSidebarScrollableElement(): HTMLElement | null {
+  if (sidebarScrollableRef.value) return sidebarScrollableRef.value
+  if (typeof document === 'undefined') return null
+  return document.querySelector<HTMLElement>('.mobile-drawer .sidebar-scrollable, .sidebar-scrollable')
+}
+
+function onSidebarScroll(event?: Event): void {
+  if (isSidebarCollapsed.value) return
+  if (isRestoringSidebarScroll) return
+  const target = event?.currentTarget
+  const container = target instanceof HTMLElement ? target : getSidebarScrollableElement()
+  sidebarScrollTop = container?.scrollTop ?? sidebarScrollTop
+}
+
+function restoreSidebarScrollPosition(): void {
+  const requestId = ++sidebarScrollRestoreRequestId
+  const targetScrollTop = sidebarScrollTop
+  const maxRestoreAttempts = 90
+  isRestoringSidebarScroll = true
+  const finishRestore = () => {
+    if (requestId === sidebarScrollRestoreRequestId) {
+      sidebarScrollTop = targetScrollTop
+      isRestoringSidebarScroll = false
+    }
+  }
+  const restore = (attempt: number) => {
+    if (requestId !== sidebarScrollRestoreRequestId) return
+    if (isSidebarCollapsed.value) {
+      finishRestore()
+      return
+    }
+
+    const container = getSidebarScrollableElement()
+    if (container) {
+      container.scrollTop = targetScrollTop
+      if (Math.abs(container.scrollTop - targetScrollTop) <= 1 || attempt >= maxRestoreAttempts) {
+        finishRestore()
+        return
+      }
+    }
+
+    if (attempt >= maxRestoreAttempts || typeof window === 'undefined') {
+      finishRestore()
+      return
+    }
+    window.requestAnimationFrame(() => restore(attempt + 1))
+  }
+
+  void nextTick(() => restore(0))
+}
+
 function onSidebarSearchKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
     isSidebarSearchVisible.value = false
@@ -2291,14 +2569,10 @@ function onAutomationsChanged(): void {
   void automationsPanelRef.value?.loadAutomations()
 }
 
-async function onExportThread(threadId: string): Promise<void> {
+async function onCopyThreadChat(threadId: string): Promise<void> {
   if (!threadId) return
-  if (selectedThreadId.value !== threadId) {
-    await selectThread(threadId)
-    await router.push({ name: 'thread', params: { threadId } })
-  }
-  await nextTick()
-  onExportChat()
+  if (selectedThreadId.value !== threadId) return
+  await copySelectedThreadChat()
 }
 
 function shortAccountId(accountId: string): string {
@@ -2325,15 +2599,15 @@ function isAccountUnavailable(account: UiAccountEntry): boolean {
 
 function isAccountActionDisabled(account: UiAccountEntry): boolean {
   return isRefreshingAccounts.value || isSwitchingAccounts.value || isStartingCodexLogin.value || isCompletingCodexLogin.value || removingAccountId.value.length > 0
-    || (account.isActive && removingAccountId.value !== account.accountId && isAccountSwitchBlocked.value)
+    || (account.isActive && removingAccountId.value !== account.storageId && isAccountSwitchBlocked.value)
 }
 
 function isRemoveConfirmationActive(account: UiAccountEntry): boolean {
-  return confirmingRemoveAccountId.value === account.accountId
+  return confirmingRemoveAccountId.value === account.storageId
 }
 
 function isRemoveVisible(account: UiAccountEntry): boolean {
-  return hoveredAccountId.value === account.accountId || isRemoveConfirmationActive(account)
+  return hoveredAccountId.value === account.storageId || isRemoveConfirmationActive(account)
 }
 
 function getAccountSwitchLabel(account: UiAccountEntry): string {
@@ -2344,7 +2618,7 @@ function getAccountSwitchLabel(account: UiAccountEntry): string {
 }
 
 function getAccountRemoveLabel(account: UiAccountEntry): string {
-  if (removingAccountId.value === account.accountId) return t('Removing…')
+  if (removingAccountId.value === account.storageId) return t('Removing…')
   if (isRemoveConfirmationActive(account)) return t('Click again to remove')
   return t('Remove')
 }
@@ -2433,10 +2707,10 @@ async function loadAccountsState(options: { silent?: boolean } = {}): Promise<vo
   try {
     const result = await getAccounts()
     accounts.value = result.accounts
-    if (!result.accounts.some((account) => account.accountId === hoveredAccountId.value)) {
+    if (!result.accounts.some((account) => account.storageId === hoveredAccountId.value)) {
       hoveredAccountId.value = ''
     }
-    if (!result.accounts.some((account) => account.accountId === confirmingRemoveAccountId.value)) {
+    if (!result.accounts.some((account) => account.storageId === confirmingRemoveAccountId.value)) {
       confirmingRemoveAccountId.value = ''
     }
   } catch (error) {
@@ -2463,6 +2737,36 @@ async function onRefreshAccounts(): Promise<void> {
     accountActionError.value = error instanceof Error ? error.message : t('Failed to refresh accounts')
   } finally {
     isRefreshingAccounts.value = false
+  }
+}
+
+async function onSwitchAccount(storageId: string): Promise<void> {
+  if (isSwitchingAccounts.value || isRefreshingAccounts.value || isStartingCodexLogin.value || isCompletingCodexLogin.value) return
+  if (isAccountSwitchBlocked.value) {
+    accountActionError.value = t('Finish the current turn and pending requests before switching accounts.')
+    return
+  }
+  accountActionError.value = ''
+  hoveredAccountId.value = ''
+  confirmingRemoveAccountId.value = ''
+  isSwitchingAccounts.value = true
+  try {
+    const nextActiveAccount = await switchAccount(storageId)
+    accounts.value = accounts.value.map((account) => (
+      account.storageId === storageId
+        ? nextActiveAccount
+        : { ...account, isActive: false }
+    ))
+    stopPolling()
+    startPolling()
+    void refreshAll({
+      includeSelectedThreadMessages: true,
+    })
+    void loadAccountsState({ silent: true })
+  } catch (error) {
+    accountActionError.value = error instanceof Error ? error.message : t('Failed to switch account')
+  } finally {
+    isSwitchingAccounts.value = false
   }
 }
 
@@ -2519,42 +2823,12 @@ async function completeCodexLoginFromCallback(callbackUrl: string): Promise<void
   }
 }
 
-async function onSwitchAccount(accountId: string): Promise<void> {
-  if (isSwitchingAccounts.value || isRefreshingAccounts.value || isStartingCodexLogin.value || isCompletingCodexLogin.value) return
-  if (isAccountSwitchBlocked.value) {
-    accountActionError.value = t('Finish the current turn and pending requests before switching accounts.')
-    return
-  }
-  accountActionError.value = ''
-  hoveredAccountId.value = ''
-  confirmingRemoveAccountId.value = ''
-  isSwitchingAccounts.value = true
-  try {
-    const nextActiveAccount = await switchAccount(accountId)
-    accounts.value = accounts.value.map((account) => (
-      account.accountId === accountId
-        ? nextActiveAccount
-        : { ...account, isActive: false }
-    ))
-    stopPolling()
-    startPolling()
-    void refreshAll({
-      includeSelectedThreadMessages: true,
-    })
-    void loadAccountsState({ silent: true })
-  } catch (error) {
-    accountActionError.value = error instanceof Error ? error.message : t('Failed to switch account')
-  } finally {
-    isSwitchingAccounts.value = false
-  }
-}
-
-async function onRemoveAccount(accountId: string): Promise<void> {
+async function onRemoveAccount(storageId: string): Promise<void> {
   if (isRefreshingAccounts.value || isSwitchingAccounts.value || isStartingCodexLogin.value || isCompletingCodexLogin.value || removingAccountId.value.length > 0) return
-  const targetAccount = accounts.value.find((account) => account.accountId === accountId) ?? null
+  const targetAccount = accounts.value.find((account) => account.storageId === storageId) ?? null
   if (!targetAccount) return
-  if (confirmingRemoveAccountId.value !== accountId) {
-    confirmingRemoveAccountId.value = accountId
+  if (confirmingRemoveAccountId.value !== storageId) {
+    confirmingRemoveAccountId.value = storageId
     return
   }
   if (targetAccount.isActive && isAccountSwitchBlocked.value) {
@@ -2565,9 +2839,9 @@ async function onRemoveAccount(accountId: string): Promise<void> {
   const removedWasActive = targetAccount.isActive
   accountActionError.value = ''
   confirmingRemoveAccountId.value = ''
-  removingAccountId.value = accountId
+  removingAccountId.value = storageId
   try {
-    const result = await removeAccount(accountId)
+    const result = await removeAccount(storageId)
     accounts.value = result.accounts
     stopPolling()
     startPolling()
@@ -2669,6 +2943,110 @@ function onBrowseProjectFiles(projectName: string): void {
   window.open(`/codex-local-browse${encodeURI(targetCwd)}`, '_blank', 'noopener,noreferrer')
 }
 
+async function onSaveProject(projectName: string): Promise<void> {
+  const targetCwd = getProjectCwd(projectName)
+  await exportProjectZipForCwd(targetCwd)
+}
+
+async function onSaveThreadProject(threadId: string): Promise<void> {
+  const targetCwd = getThreadCwd(threadId)
+  await exportProjectZipForCwd(targetCwd)
+}
+
+function getThreadCwd(threadId: string): string {
+  for (const group of projectGroups.value) {
+    const thread = group.threads.find((row) => row.id === threadId)
+    if (thread?.cwd?.trim()) return thread.cwd.trim()
+  }
+  return ''
+}
+
+function formatByteCount(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`
+}
+
+function downloadProjectZipFallback(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000)
+}
+
+async function shareProjectZip(blob: Blob, fileName: string): Promise<void> {
+  const file = new File([blob], fileName, { type: blob.type || 'application/zip' })
+  const shareData = {
+    files: [file],
+    title: fileName,
+  }
+  const canShareFiles = typeof navigator !== 'undefined'
+    && typeof navigator.share === 'function'
+    && (typeof navigator.canShare !== 'function' || navigator.canShare(shareData))
+  if (!canShareFiles) {
+    throw new Error('File sharing is not supported in this browser.')
+  }
+  await navigator.share(shareData)
+}
+
+function onCloseProjectZipExportModal(): void {
+  if (projectZipExportStatus.value.phase === 'exporting') return
+  projectZipExportStatus.value = { phase: 'idle', loaded: 0, total: null, blob: null, fileName: '', error: '' }
+}
+
+function onDownloadProjectZipExport(): void {
+  const { blob, fileName } = projectZipExportStatus.value
+  if (!blob || !fileName) return
+  projectZipExportStatus.value = { ...projectZipExportStatus.value, error: '' }
+  downloadProjectZipFallback(blob, fileName)
+}
+
+async function onShareProjectZipExport(): Promise<void> {
+  const { blob, fileName } = projectZipExportStatus.value
+  if (!blob || !fileName) return
+  try {
+    projectZipExportStatus.value = { ...projectZipExportStatus.value, error: '' }
+    await shareProjectZip(blob, fileName)
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    const message = error instanceof Error ? error.message : ''
+    const wasBlocked = error instanceof DOMException && error.name === 'NotAllowedError'
+      || /permission denied|notallowed|not allowed|gesture/iu.test(message)
+    projectZipExportStatus.value = {
+      ...projectZipExportStatus.value,
+      error: wasBlocked
+        ? t('This browser blocked sharing the ZIP. Use Download instead.')
+        : (message || t('Failed to share project. Use Download instead.')),
+    }
+  }
+}
+
+async function exportProjectZipForCwd(targetCwd: string): Promise<void> {
+  if (!targetCwd || typeof document === 'undefined') return
+  projectZipExportStatus.value = { phase: 'exporting', loaded: 0, total: null, blob: null, fileName: '', error: '' }
+  try {
+    const { blob, fileName } = await downloadProjectZip(targetCwd, ({ loaded, total }) => {
+      projectZipExportStatus.value = { ...projectZipExportStatus.value, phase: 'exporting', loaded, total }
+    })
+    projectZipExportStatus.value = { phase: 'ready', loaded: blob.size, total: blob.size, blob, fileName, error: '' }
+  } catch (error) {
+    projectZipExportStatus.value = { phase: 'idle', loaded: 0, total: null, blob: null, fileName: '', error: '' }
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    const message = error instanceof Error ? error.message : 'Failed to export project.'
+    window.alert(message)
+  }
+}
+
 async function onCreateProjectWorktree(projectName: string): Promise<void> {
   const sourceCwd = getProjectCwd(projectName)
   if (!sourceCwd || typeof window === 'undefined') return
@@ -2709,7 +3087,26 @@ async function onCreateProjectWorktree(projectName: string): Promise<void> {
   }
 }
 
+function resolveSelectedThreadProjectCwd(): string {
+  const thread = selectedThread.value
+  if (!thread) return ''
+  const projectName = thread.projectName?.trim() ?? ''
+  if (!projectName) return thread.cwd?.trim() ?? ''
+  return resolvePreferredLocalCwd(projectName, thread.cwd?.trim() ?? '')
+}
+
 function onStartNewThreadFromToolbar(): void {
+  const resolvedCwd = resolveSelectedThreadProjectCwd()
+  if (resolvedCwd) {
+    newThreadCwd.value = resolvedCwd
+  }
+  newThreadRuntime.value = 'local'
+  if (isMobile.value) setSidebarCollapsed(true)
+  if (isHomeRoute.value) return
+  void router.push({ name: 'home' })
+}
+
+function onStartProjectlessNewChat(): void {
   newThreadCwd.value = ''
   newThreadRuntime.value = 'local'
   if (isMobile.value) setSidebarCollapsed(true)
@@ -2801,8 +3198,17 @@ async function onForkThreadFromMessage(payload: { threadId: string; turnIndex: n
 
 function setSidebarCollapsed(nextValue: boolean): void {
   if (isSidebarCollapsed.value === nextValue) return
+  if (nextValue) {
+    const currentScrollTop = getSidebarScrollableElement()?.scrollTop
+    if (typeof currentScrollTop === 'number' && (currentScrollTop > 0 || sidebarScrollTop === 0)) {
+      sidebarScrollTop = currentScrollTop
+    }
+  }
   isSidebarCollapsed.value = nextValue
   saveSidebarCollapsed(nextValue)
+  if (!nextValue) {
+    restoreSidebarScrollPosition()
+  }
 }
 
 function onWindowKeyDown(event: KeyboardEvent): void {
@@ -3206,6 +3612,8 @@ function canLoadBranchStateForCwd(cwd: string): boolean {
 function resetThreadBranchState(): void {
   threadBranchesRequestId += 1
   threadBranchCommitsRequestId += 1
+  threadCommitFilesRequestId += 1
+  threadWorktreeSummaryRequestId += 1
   threadBranchOptions.value = []
   currentThreadBranch.value = null
   currentThreadHeadSha.value = null
@@ -3213,11 +3621,36 @@ function resetThreadBranchState(): void {
   currentThreadHeadDate.value = null
   isThreadDetachedHead.value = false
   isThreadWorktreeDirty.value = false
+  threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
   threadBranchCommitsByBranch.value = {}
   threadBranchCommitsLoadingFor.value = ''
   threadBranchCommitsError.value = ''
+  threadCommitFilesBySha.value = {}
+  threadCommitFilesLoadingFor.value = ''
+  threadCommitFilesError.value = ''
   threadBranchError.value = ''
   isLoadingThreadBranches.value = false
+}
+
+function loadThreadWorktreeChangeSummary(cwd: string): void {
+  const targetCwd = cwd.trim()
+  if (!targetCwd) {
+    threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
+    return
+  }
+  const requestId = ++threadWorktreeSummaryRequestId
+  void getReviewSummary(targetCwd, 'unstaged')
+    .then((summary) => {
+      if (requestId !== threadWorktreeSummaryRequestId || !canLoadBranchStateForCwd(targetCwd)) return
+      threadWorktreeChangeSummary.value = {
+        addedLineCount: summary.addedLineCount,
+        removedLineCount: summary.removedLineCount,
+      }
+    })
+    .catch(() => {
+      if (requestId !== threadWorktreeSummaryRequestId || !canLoadBranchStateForCwd(targetCwd)) return
+      threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
+    })
 }
 
 async function loadThreadBranches(cwd: string): Promise<void> {
@@ -3239,6 +3672,9 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadHeadDate.value = state.headDate
     isThreadDetachedHead.value = state.detached
     isThreadWorktreeDirty.value = state.dirty
+    loadThreadWorktreeChangeSummary(targetCwd)
+    const defaultBranchForCommits = state.currentBranch?.trim() || state.options[0]?.value?.trim() || ''
+    if (defaultBranchForCommits) loadThreadBranchCommits({ branch: defaultBranchForCommits, includeResetHistory: true })
   } catch {
     if (requestId !== threadBranchesRequestId || !canLoadBranchStateForCwd(targetCwd)) return
     threadBranchOptions.value = []
@@ -3248,6 +3684,7 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadHeadDate.value = null
     isThreadDetachedHead.value = false
     isThreadWorktreeDirty.value = false
+    threadWorktreeChangeSummary.value = { addedLineCount: 0, removedLineCount: 0 }
   } finally {
     if (requestId === threadBranchesRequestId) {
       isLoadingThreadBranches.value = false
@@ -3262,6 +3699,7 @@ function applyThreadGitState(state: { currentBranch: string | null; headSha: str
   currentThreadHeadDate.value = state.headDate
   isThreadDetachedHead.value = state.detached
   isThreadWorktreeDirty.value = state.dirty
+  loadThreadWorktreeChangeSummary(composerCwd.value)
 }
 
 function onCheckoutContentHeaderBranch(value: string): void {
@@ -3319,20 +3757,22 @@ function onResetContentHeaderBranchToCommit(payload: { branch: string; sha: stri
     })
 }
 
-function loadThreadBranchCommits(branch: string): void {
-  const targetBranch = branch.trim()
+function loadThreadBranchCommits(payload: string | { branch: string; includeResetHistory?: boolean }): void {
+  const targetBranch = (typeof payload === 'string' ? payload : payload.branch).trim()
+  const includeResetHistory = typeof payload === 'string' ? true : payload.includeResetHistory !== false
   const cwd = composerCwd.value.trim()
-  if (!targetBranch || !cwd || threadBranchCommitsLoadingFor.value === targetBranch) return
-  if (threadBranchCommitsByBranch.value[targetBranch]) return
-  const requestId = ++threadBranchCommitsRequestId
-  threadBranchCommitsLoadingFor.value = targetBranch
+  const cacheKey = toThreadBranchCommitsKey(targetBranch, includeResetHistory)
+  if (!targetBranch || !cwd || threadBranchCommitsLoadingFor.value === cacheKey) return
   threadBranchCommitsError.value = ''
-  void getGitBranchCommits(cwd, targetBranch)
+  if (threadBranchCommitsByBranch.value[cacheKey]) return
+  const requestId = ++threadBranchCommitsRequestId
+  threadBranchCommitsLoadingFor.value = cacheKey
+  void getGitBranchCommits(cwd, targetBranch, { includeResetHistory })
     .then((commits) => {
       if (requestId !== threadBranchCommitsRequestId || !canLoadBranchStateForCwd(cwd)) return
       threadBranchCommitsByBranch.value = {
         ...threadBranchCommitsByBranch.value,
-        [targetBranch]: commits,
+        [cacheKey]: commits,
       }
     })
     .catch((error: unknown) => {
@@ -3340,10 +3780,59 @@ function loadThreadBranchCommits(branch: string): void {
       threadBranchCommitsError.value = error instanceof Error ? error.message : 'Failed to load branch commits'
     })
     .finally(() => {
-      if (requestId === threadBranchCommitsRequestId && threadBranchCommitsLoadingFor.value === targetBranch) {
+      if (requestId === threadBranchCommitsRequestId && threadBranchCommitsLoadingFor.value === cacheKey) {
         threadBranchCommitsLoadingFor.value = ''
       }
     })
+}
+
+function loadThreadCommitFiles(sha: string): void {
+  const targetSha = sha.trim()
+  const cwd = composerCwd.value.trim()
+  if (!targetSha || !cwd || threadCommitFilesLoadingFor.value === targetSha) return
+  threadCommitFilesError.value = ''
+  if (threadCommitFilesBySha.value[targetSha]) return
+  const requestId = ++threadCommitFilesRequestId
+  threadCommitFilesLoadingFor.value = targetSha
+  void getGitCommitFiles(cwd, targetSha)
+    .then((files) => {
+      if (requestId !== threadCommitFilesRequestId || !canLoadBranchStateForCwd(cwd)) return
+      threadCommitFilesBySha.value = {
+        ...threadCommitFilesBySha.value,
+        [targetSha]: files,
+      }
+    })
+    .catch((error: unknown) => {
+      if (requestId !== threadCommitFilesRequestId || !canLoadBranchStateForCwd(cwd)) return
+      threadCommitFilesError.value = error instanceof Error ? error.message : 'Failed to load commit files'
+    })
+    .finally(() => {
+      if (requestId === threadCommitFilesRequestId && threadCommitFilesLoadingFor.value === targetSha) {
+        threadCommitFilesLoadingFor.value = ''
+      }
+    })
+}
+
+function onOpenContentHeaderCommitFile(payload: { sha: string; path: string }): void {
+  const targetPath = payload.path.trim()
+  const targetSha = payload.sha.trim()
+  if (!targetPath || !targetSha) return
+  reviewInitialFilePath.value = targetPath
+  reviewInitialCommitSha.value = targetSha
+  isReviewPaneOpen.value = true
+}
+
+function onToggleContentHeaderReview(): void {
+  reviewInitialFilePath.value = ''
+  reviewInitialCommitSha.value = ''
+  isReviewPaneOpen.value = !isReviewPaneOpen.value
+}
+
+function clearCommitReviewContext(): void {
+  if (!reviewInitialFilePath.value && !reviewInitialCommitSha.value) return
+  reviewInitialFilePath.value = ''
+  reviewInitialCommitSha.value = ''
+  isReviewPaneOpen.value = false
 }
 
 async function onOpenProjectSetupModal(): Promise<void> {
@@ -3411,6 +3900,49 @@ async function onSubmitProjectSetup(): Promise<void> {
   } finally {
     isProjectSetupSubmitting.value = false
   }
+}
+
+function onChooseProjectImportZip(): void {
+  openProjectImportInput(projectImportInputRef.value)
+}
+
+function openProjectImportInput(input: HTMLInputElement | null): void {
+  if (isProjectImporting.value || !input) return
+  input.value = ''
+  input.click()
+}
+
+async function finishProjectImport(
+  input: HTMLInputElement | null,
+  importer: (baseDir: string) => Promise<{ path: string }>,
+  fallbackMessage: string,
+): Promise<void> {
+  isProjectImporting.value = true
+  try {
+    const baseDir = await resolveProjectBaseDirectory()
+    if (!baseDir) return
+    const result = await importer(baseDir)
+    if (!result.path) return
+    newThreadCwd.value = result.path
+    pinProjectToTop(getProjectOrderNameForPath(result.path))
+    await loadWorkspaceRootOptionsState()
+    await refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    await refreshDefaultProjectName()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : fallbackMessage
+    window.alert(message)
+  } finally {
+    isProjectImporting.value = false
+    if (input) input.value = ''
+  }
+}
+
+async function onDirectProjectImportFileChange(event: Event): Promise<void> {
+  const input = event.target instanceof HTMLInputElement ? event.target : null
+  const file = input?.files?.[0] ?? null
+  if (!file || isProjectImporting.value) return
+
+  await finishProjectImport(input, (baseDir) => importProjectZip(file, baseDir), 'Failed to import project.')
 }
 
 async function onOpenExistingFolder(): Promise<void> {
@@ -3491,6 +4023,7 @@ async function onConfirmExistingFolder(path = resolvedExistingFolderPath.value):
     newThreadCwd.value = normalizedPath
     pinProjectToTop(getProjectOrderNameForPath(normalizedPath))
     await loadWorkspaceRootOptionsState()
+    await refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
     await refreshDefaultProjectName()
     onCloseExistingFolderPanel()
   } catch (error) {
@@ -3797,20 +4330,15 @@ function onImplementPlan(payload: { turnId: string }): void {
 }
 
 
-function onExportChat(): void {
-  if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value || typeof document === 'undefined') return
+async function copySelectedThreadChat(): Promise<void> {
+  if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value) return
   if (!selectedThread.value || filteredMessages.value.length === 0) return
   const markdown = buildThreadMarkdown()
-  const fileName = buildExportFileName()
-  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
-  const objectUrl = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = objectUrl
-  link.download = fileName
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+  try {
+    await copyTextToClipboard(markdown)
+  } catch {
+    // Clipboard writes can be blocked by browser permissions; keep the menu action best-effort.
+  }
 }
 
 function buildThreadMarkdown(): string {
@@ -3868,17 +4396,6 @@ function buildThreadMarkdown(): string {
   }
 
   return `${lines.join('\n').trimEnd()}\n`
-}
-
-function buildExportFileName(): string {
-  const threadTitle = selectedThread.value?.title?.trim() || 'chat'
-  const sanitized = threadTitle
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-  const base = sanitized || 'chat'
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  return `${base}-${stamp}.md`
 }
 
 function escapeMarkdownText(value: string): string {
@@ -3967,7 +4484,7 @@ async function onProviderChange(provider: string): Promise<void> {
     } else if (provider === 'opencode-zen') {
       selectedProvider.value = 'opencode-zen'
       await setCustomProvider('', opencodeZenKey.value.trim(), {
-        wireApi: 'chat',
+        wireApi: 'responses',
         provider: 'opencode-zen',
       })
       freeModeEnabled.value = true
@@ -3982,9 +4499,6 @@ async function onProviderChange(provider: string): Promise<void> {
     }
     providerError.value = ''
     await refreshAll({ includeSelectedThreadMessages: false, providerChanged: true, awaitAncillaryRefreshes: true })
-    if (route.name === 'thread') {
-      void router.push({ name: 'home' })
-    }
   } catch (err) {
     providerError.value = err instanceof Error ? err.message : 'Failed to switch provider'
   } finally {
@@ -4041,7 +4555,7 @@ async function saveOpencodeZen(): Promise<void> {
   try {
     providerError.value = ''
     await setCustomProvider('', key, {
-      wireApi: 'chat',
+      wireApi: 'responses',
       provider: 'opencode-zen',
     })
     freeModeEnabled.value = true
@@ -4086,6 +4600,7 @@ async function clearFreeModeCustomKey(): Promise<void> {
 
 async function loadFreeModeStatus(): Promise<void> {
   try {
+    const previousProvider = selectedProvider.value
     const status = await getFreeModeStatus()
     freeModeEnabled.value = status.enabled
     freeModeHasCustomKey.value = status.customKey ?? false
@@ -4103,6 +4618,26 @@ async function loadFreeModeStatus(): Promise<void> {
       }
     } else {
       selectedProvider.value = 'codex'
+    }
+    externalCodexAuthAvailable = status.hasCodexAuth === true
+    if (!externalCodexAuthAvailable) {
+      externalAuthImportAttempted = false
+    }
+    const providerChanged = selectedProvider.value !== previousProvider
+    if (providerChanged) {
+      await refreshAll({
+        includeSelectedThreadMessages: false,
+        providerChanged: true,
+        awaitAncillaryRefreshes: true,
+      })
+    }
+    const importedExternalAuth = await maybeImportExternalCodexAuthAccount()
+    if (importedExternalAuth) {
+      await refreshAll({
+        includeSelectedThreadMessages: false,
+        providerChanged: providerChanged || importedExternalAuth,
+        awaitAncillaryRefreshes: true,
+      })
     }
   } catch {
     // Ignore — free mode status unknown
@@ -4226,6 +4761,8 @@ async function initialize(): Promise<void> {
 
   if (route.name === 'thread' && routeThreadId.value) {
     primeSelectedThread(routeThreadId.value)
+  } else if (route.name === 'home' || route.name === 'skills' || route.name === 'automations') {
+    primeSelectedThread('', { persist: false })
   }
 
   await refreshAll({
@@ -4236,11 +4773,6 @@ async function initialize(): Promise<void> {
   hasInitialized.value = true
   await syncThreadSelectionWithRoute()
   startPolling()
-}
-
-function threadExistsInSidebar(threadId: string): boolean {
-  if (!threadId) return false
-  return projectGroups.value.some((group) => group.threads.some((thread) => thread.id === threadId))
 }
 
 async function syncThreadSelectionWithRoute(): Promise<void> {
@@ -4266,17 +4798,14 @@ async function syncThreadSelectionWithRoute(): Promise<void> {
         if (!threadId) continue
 
         if (selectedThreadId.value !== threadId) {
-          if (!threadExistsInSidebar(threadId)) {
-            if (selectedThreadId.value) {
-              await router.replace({ name: 'thread', params: { threadId: selectedThreadId.value } })
-            } else {
-              await router.replace({ name: 'home' })
-            }
+          const result = await selectThread(threadId)
+          if (result === 'not-found') {
             continue
           }
-          await selectThread(threadId)
         } else {
-          void ensureThreadMessagesLoaded(threadId, { silent: true })
+          void ensureThreadMessagesLoaded(threadId, { silent: true }).catch(() => {
+            // The conversation overlay receives the error from useDesktopState.
+          })
         }
       }
     } while (hasPendingRouteSync)
@@ -4304,6 +4833,13 @@ watch(
   () => composerCwd.value,
   () => {
     void refreshTerminalQuickCommands()
+  },
+)
+
+watch(
+  () => [selectedThreadId.value, composerCwd.value] as const,
+  () => {
+    clearCommitReviewContext()
   },
 )
 
@@ -4753,6 +5289,18 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   @apply w-full shrink-0 px-2 sm:px-6 flex flex-col gap-2;
 }
 
+.composer-runtime-error {
+  @apply flex w-full items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-800 shadow-sm;
+}
+
+.visible-error-with-feedback {
+  @apply flex items-start justify-between gap-3;
+}
+
+.visible-error-feedback {
+  @apply shrink-0 rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
+}
+
 .content-thread-terminal-panel {
   @apply w-full;
 }
@@ -4852,6 +5400,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .new-thread-folder-actions {
   @apply mt-3 flex w-full max-w-3xl flex-wrap items-center justify-center gap-2;
+}
+
+.new-thread-project-import-input {
+  display: none;
 }
 
 .new-thread-launch-card {
@@ -5508,12 +6060,16 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   @apply shrink-0 w-6 h-6 flex items-center justify-center rounded-full border border-zinc-200 text-xs text-zinc-400 transition-colors hover:text-zinc-600 hover:border-zinc-300 disabled:opacity-40;
 }
 
-.sidebar-settings-provider-select {
-  @apply min-w-0 max-w-40 rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 outline-none transition-colors cursor-pointer;
+.sidebar-settings-provider-dropdown {
+  @apply min-w-0 max-w-44;
 }
 
-.sidebar-settings-provider-select:focus {
-  @apply border-zinc-400 ring-2 ring-zinc-200;
+.sidebar-settings-provider-dropdown :deep(.composer-dropdown-trigger) {
+  @apply h-auto rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700;
+}
+
+.sidebar-settings-provider-dropdown :deep(.composer-dropdown-value) {
+  @apply max-w-36;
 }
 
 .sidebar-settings-segmented {
@@ -5534,14 +6090,6 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .sidebar-settings-provider-link {
   @apply text-xs text-blue-600 hover:text-blue-700 underline shrink-0;
-}
-
-:root.dark .sidebar-settings-provider-select {
-  @apply border-zinc-600 bg-zinc-800 text-zinc-200;
-}
-
-:root.dark .sidebar-settings-provider-select:focus {
-  @apply border-zinc-500 ring-zinc-700;
 }
 
 :root.dark .sidebar-settings-segmented {
@@ -5589,6 +6137,97 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 .settings-panel-leave-to {
   opacity: 0;
   transform: translateY(8px);
+}
+
+.project-zip-modal-backdrop {
+  @apply fixed inset-0 z-[100] flex items-center justify-center bg-black/35 px-4;
+}
+
+.project-zip-modal {
+  @apply flex w-full max-w-md flex-col gap-4 rounded-xl border border-zinc-200 bg-white p-4 text-zinc-900 shadow-2xl;
+}
+
+.project-zip-modal-header {
+  @apply flex items-center justify-between gap-3;
+}
+
+.project-zip-modal-title {
+  @apply text-base font-semibold;
+}
+
+.project-zip-modal-close {
+  @apply inline-flex h-7 w-7 items-center justify-center rounded-full border border-zinc-200 bg-white text-lg leading-none text-zinc-600 transition hover:bg-zinc-50 disabled:cursor-default disabled:opacity-60;
+}
+
+.project-zip-modal-copy {
+  @apply min-h-5 truncate text-sm text-zinc-600;
+}
+
+.project-zip-modal-error {
+  @apply rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900;
+}
+
+.project-zip-progress-label {
+  @apply flex items-center justify-between gap-3 text-sm font-semibold;
+}
+
+.project-zip-progress-label span:last-child {
+  @apply shrink-0 text-xs font-medium text-zinc-500;
+}
+
+.project-zip-progress-track {
+  @apply h-2 overflow-hidden rounded-full bg-zinc-100;
+}
+
+.project-zip-progress-fill {
+  @apply h-full rounded-full bg-emerald-600 transition-all duration-150;
+}
+
+.project-zip-modal-actions {
+  @apply flex items-center justify-end gap-2;
+}
+
+.project-zip-modal-cancel,
+.project-zip-modal-action {
+  @apply rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-default disabled:opacity-60;
+}
+
+.project-zip-modal-action-primary {
+  @apply border-zinc-900 bg-zinc-900 text-white hover:bg-zinc-800;
+}
+
+:root.dark .project-zip-modal {
+  @apply border-zinc-700 bg-zinc-900 text-zinc-100;
+}
+
+:root.dark .project-zip-modal-close,
+:root.dark .project-zip-modal-cancel,
+:root.dark .project-zip-modal-action {
+  @apply border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800;
+}
+
+:root.dark .project-zip-modal-copy {
+  @apply text-zinc-400;
+}
+
+:root.dark .project-zip-modal-error {
+  @apply border-amber-900/60 bg-amber-950/40 text-amber-100;
+}
+
+:root.dark .project-zip-modal-action-primary {
+  @apply border-zinc-100 bg-zinc-100 text-zinc-950 hover:bg-white;
+}
+
+:root.dark .project-zip-progress-label span:last-child {
+  @apply text-zinc-400;
+}
+
+:root.dark .project-zip-progress-track {
+  @apply bg-zinc-800;
+}
+
+:root.dark .project-zip-progress-fill {
+  @apply bg-emerald-500;
 }
 
 .sidebar-settings-context-row {

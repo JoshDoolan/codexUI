@@ -1,12 +1,12 @@
 ---
 name: "codex-app-parity"
-description: "Use when implementing or changing user-visible behavior/UI in this repository and parity with the installed Codex desktop app must be validated before coding."
+description: "Use only when the user explicitly mentions Codex parity, codex-app-parity, Codex.app parity, or asks to compare against the installed Codex desktop app."
 ---
 
 # Codex App Parity Skill
 
-Use this skill for any feature work or user-visible behavior/UI change in this repository.
-Do not use it for purely internal refactors that do not affect behavior.
+Use this skill only when the user explicitly asks for Codex parity work, names `codex-app-parity`, mentions Codex.app parity, or asks to compare behavior against the installed Codex desktop app.
+Do not auto-trigger this skill for ordinary feature work, UI changes, or user-visible behavior changes unless the user explicitly requests that parity workflow.
 
 ## Objective
 
@@ -18,7 +18,7 @@ Ensure behavior is implemented with Codex.app as the source of truth, then verif
 
 For user-visible Directory, Skills, Apps, Plugins, MCP, or Composio changes in this repo:
 
-- Update `tests.md` with manual verification steps, including light and dark theme checks.
+- Update the relevant manual test doc under `tests/<domain>/...` with verification steps, including light and dark theme checks. Update `tests.md` only when adding, renaming, or removing a domain folder.
 - If the change creates or changes durable behavior/architecture, add or update an `llm-wiki/raw/...` source and corresponding `llm-wiki/wiki/...` concept page.
 - Keep `whatToTest.md` as a short pending-only checklist; remove items that were actually executed successfully.
 - Prefer assertions plus screenshots for browser validation; screenshots alone are not enough.
@@ -173,6 +173,13 @@ The script:
 - auto-picks free CDP and Node inspector ports
 - verifies the endpoints after launch
 - prepares the required native Sparkle shim for external-Electron runs
+
+If the helper script fails, treat the failure as a skill maintenance signal, not just a one-off launch error:
+
+- Inspect the failing shell script and its nearby helper scripts before using a manual fallback.
+- Fix durable launcher bugs in the `.sh` scripts when the cause is clear and local to the script.
+- Re-run the helper after the fix and update this skill with any new reliable launch finding.
+- Use a manual launch fallback only when the script cannot be repaired safely in the current task.
 
 Use `--verify-only` when you only need to confirm whether the current endpoints are still alive.
 
